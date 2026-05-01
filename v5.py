@@ -1,0 +1,953 @@
+import os
+import re
+import glob
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from scipy.ndimage import uniform_filter, label, distance_transform_edt
+from collections import Counter
+import json
+from datetime import datetime
+
+OUTPUT_ROOT = "/Users/ezracoburn/Documents/Simple/output/4-16/Autel-East of Vaihu - 1.0 deltac"
+
+BYFRAME_DIR = os.path.join(OUTPUT_ROOT, "byframe")
+PASSES_DIR = os.path.join(BYFRAME_DIR, "passes")
+CUTS_DIR = os.path.join(BYFRAME_DIR, "cuts")
+LAYER_DIR = os.path.join(OUTPUT_ROOT, "layers")
+
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
+os.makedirs(BYFRAME_DIR, exist_ok=True)
+os.makedirs(PASSES_DIR, exist_ok=True)
+os.makedirs(CUTS_DIR, exist_ok=True)
+os.makedirs(LAYER_DIR, exist_ok=True)
+
+NUM_IMAGES = 50
+
+MIN_SMOOTH_FRAC = 0.10
+S2_OVER_S_MIN = 0.8
+BASELINE_PERCENTILE = 90
+BASELINE_BAND_DELTA_C = 0.1
+SGD_MIN_DELTA_C = 1.0
+
+TEX_BINS = 256
+TEX_WIN = 9
+
+# Angle-knee params 
+    # Main smoothing (HIST_SMOOTH_K) is used for thresholding and stable peak geometry.
+    # A lighter smoothing (PEAK_HEIGHT_K) is used only to compute rawer_peak_height,
+    # which is intended to be a more sensitive QC metric for tall/narrow ocean peaks.
+    # kernel must be even
+HIST_SMOOTH_K = 7 
+ANGLE_DEG = 0.7
+ANGLE_RUN = 6
+PEAK_HEIGHT_K = 3
+
+
+# histogram metric filters
+# primary filter
+PEAK_HEIGHT_MIN = 0.07 
+# liberal sanity check filters
+TEXTURE_THR_MAX = 0.5
+PEAK_X_MAX = 0.15
+PEAK_WIDTH_MAX = 0.2
+PEAK_SHARPNESS_MIN = 0.1
+
+SAVE_CUT_DEBUG = True
+CUT_DEBUG_DPI = 120
+
+# S2 mode: keep only pixels within X pixels of the largest component
+S2_MODE = "largest"      # "largest" | "edge" | "within_x"
+CONNECTIVITY_8 = True
+
+DILATE_PIXELS = 0        # X pixels: keep S pixels with distance-to-largest <= X
+
+# Optional debug output
+SAVE_DIST_HEATMAP = False
+DIST_HEATMAP_CLIP = 30   # clip distances for visualization (pixels)
+                         #CANNOT SET TO 0 (runtime)
+
+FILTERS_ENABLED = {
+    "thr_max": True,
+    "peak_x_max": True,
+    "peak_height_min": True,
+    "peak_width_max": True,
+    "peak_sharpness_min": False,
+    "s2_min_frac_baseline_skip": True,
+    "s2_over_s_min": True,
+}
+
+def _new_report():
+    return {
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "filters_enabled": dict(FILTERS_ENABLED),
+        "num_selected": 0,
+        "num_processed": 0,          # process_one reached the end (produced overlays)
+        "num_skipped": 0,            # process_one returned early
+        "skipped_by_reason": Counter(),
+        "num_baseline_skipped": 0,   # processed but baseline not computed
+        "baseline_skipped_by_reason": Counter(),
+        "frames": [],                # per-frame records (extensible)
+        "cuts_by_step": {},          # step -> reason -> [files]
+    }
+
+
+def _report_add_cut(report, step: str, reason: str, base: str):
+    cuts = report["cuts_by_step"].setdefault(step, {})
+    cuts.setdefault(reason, []).append(base)
+
+
+def _report_add_skip(report, frame_id, base, reason, details=None, step="unknown"):
+    report["num_skipped"] += 1
+    report["skipped_by_reason"][reason] += 1
+    _report_add_cut(report, step, reason, base)
+    report["frames"].append({
+        "frame_id": frame_id,
+        "file": base,
+        "status": "skipped",
+        "step": step,
+        "reason": reason,
+        "details": details or {}
+    })
+
+
+def _report_add_processed(report, frame_id, base, details=None):
+    report["num_processed"] += 1
+    report["frames"].append({
+        "frame_id": frame_id,
+        "file": base,
+        "status": "processed",
+        "details": details or {}
+    })
+
+
+def _report_add_baseline_skip(report, frame_id, base, reason, details=None, step="baseline"):
+    report["num_baseline_skipped"] += 1
+    report["baseline_skipped_by_reason"][reason] += 1
+    _report_add_cut(report, step, reason, base)
+    report["frames"].append({
+        "frame_id": frame_id,
+        "file": base,
+        "status": "baseline_skipped",
+        "step": step,
+        "reason": reason,
+        "details": details or {}
+    })
+
+
+def write_report(report, output_root):
+    report_out = dict(report)
+    report_out["skipped_by_reason"] = dict(report["skipped_by_reason"])
+    report_out["baseline_skipped_by_reason"] = dict(report["baseline_skipped_by_reason"])
+    report_out["cuts_by_step"] = report.get("cuts_by_step", {})
+    report_out["finished_at"] = datetime.now().isoformat(timespec="seconds")
+
+    path_json = os.path.join(OUTPUT_ROOT, "run_report.json")
+    with open(path_json, "w") as f:
+        json.dump(report_out, f, indent=2)
+
+
+def write_text_report(report, output_root):
+    path_txt = os.path.join(OUTPUT_ROOT, "run_report.txt")
+    with open(path_txt, "w") as f:
+        f.write("=== RUN REPORT ===\n")
+        f.write(f"started_at: {report['started_at']}\n")
+        f.write(f"finished_at: {datetime.now().isoformat(timespec='seconds')}\n\n")
+        f.write(f"num_selected: {report['num_selected']}\n")
+        f.write(f"num_processed: {report['num_processed']}\n")
+        f.write(f"num_skipped: {report['num_skipped']}\n")
+        f.write(f"num_baseline_skipped: {report['num_baseline_skipped']}\n\n")
+
+        f.write("=== CUTS BY STEP ===\n")
+        cuts = report.get("cuts_by_step", {})
+        if not cuts:
+            f.write("(none)\n")
+            return
+
+        for step in sorted(cuts.keys()):
+            f.write(f"\n[{step}]\n")
+            for reason in sorted(cuts[step].keys()):
+                files = cuts[step][reason]
+                f.write(f"  - {reason}: {len(files)}\n")
+                for name in files:
+                    f.write(f"      {name}\n")
+
+
+def find_frame_id(path: str):
+    m = re.search(r"IRX_(\d{4})", os.path.basename(path))
+    return m.group(1) if m else None
+
+
+def find_media_dirs(flight_root: str):
+    media_dirs = []
+    for d in glob.glob(os.path.join(flight_root, "**", "*MEDIA"), recursive=True):
+        if os.path.isdir(d) and re.search(r"[\\/]\d{3}MEDIA$", d):
+            media_dirs.append(d)
+    return sorted(set(media_dirs))
+
+
+def list_camera_tiffs(flight_root: str):
+    media_dirs = find_media_dirs(flight_root)
+    search_roots = media_dirs if media_dirs else [flight_root]
+
+    patterns = [
+        "IRX_*.tif", "IRX_*.tiff",
+        "IRX_*.TIF", "IRX_*.TIFF",
+        "irx_*.tif", "irx_*.tiff",
+        "irx_*.TIF", "irx_*.TIFF",
+    ]
+
+    candidates = []
+    for root in search_roots:
+        for pat in patterns:
+            candidates.extend(glob.glob(os.path.join(root, "**", pat), recursive=True))
+
+    out = []
+    for p in sorted(set(candidates)):
+        name = os.path.basename(p)
+        if not re.fullmatch(r"IRX_\d{4}\.(tif|tiff|TIF|TIFF)", name):
+            continue
+        fid = find_frame_id(p)
+        if fid is None:
+            continue
+        base = name.lower()
+        if "rpeg" in base or "rgb" in base or "mosaic" in base or "orth" in base:
+            continue
+        out.append(p)
+
+    return out, media_dirs
+
+
+def pick_evenly_spaced(items, k):
+    n = len(items)
+    if n <= k:
+        return items
+    idx = np.linspace(0, n - 1, k, dtype=int)
+    return [items[i] for i in idx]
+
+
+def to_celsius_autel(raw: np.ndarray) -> np.ndarray:
+    return raw.astype(np.float32) * 0.1 - 273.15
+
+
+def normalize_for_display(img: np.ndarray):
+    finite = np.isfinite(img)
+    v = img[finite]
+    lo = np.percentile(v, 2)
+    hi = np.percentile(v, 98)
+    if hi <= lo:
+        hi = lo + 1.0
+    out = (img - lo) / (hi - lo)
+    return np.clip(out, 0.0, 1.0)
+
+
+def overlay_and_save(background, mask, title, out_path, alpha=0.45):
+    plt.figure(figsize=(8, 6))
+    plt.imshow(background, cmap="gray", vmin=0.0, vmax=1.0)
+
+    overlay = np.zeros((mask.shape[0], mask.shape[1], 4), dtype=np.float32)
+    overlay[..., 0] = 1.0
+    overlay[..., 3] = mask.astype(np.float32) * alpha
+    plt.imshow(overlay)
+
+    plt.title(title)
+    plt.axis("off")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def local_std_texture(temp_c: np.ndarray, finite: np.ndarray, win: int = 9):
+    filled = temp_c.copy()
+    fill_val = float(np.nanmedian(temp_c[finite])) if np.any(finite) else 0.0
+    filled[~finite] = fill_val
+
+    mean = uniform_filter(filled, win)
+    mean_sq = uniform_filter(filled**2, win)
+    var = np.maximum(mean_sq - mean**2, 0)
+    return np.sqrt(var)
+
+
+def smooth_1d(x: np.ndarray, k: int) -> np.ndarray:
+    if k <= 1:
+        return x
+    if k % 2 == 0:
+        raise ValueError(f"smooth_1d requires odd k, got {k}")
+    pad = k // 2
+    xp = np.pad(x, (pad, pad), mode="edge")
+    ker = np.ones(k, dtype=np.float64) / k
+    return np.convolve(xp, ker, mode="valid")
+
+
+def angle_knee_threshold(hist: np.ndarray, bin_edges: np.ndarray,
+                         smooth_k: int = HIST_SMOOTH_K,
+                         angle_deg: float = ANGLE_DEG,
+                         run: int = ANGLE_RUN):
+    hist = hist.astype(np.float64)
+    s = hist.sum()
+    if s > 0:
+        hist = hist / s
+
+    hs = smooth_1d(hist, smooth_k)
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+
+    peak_idx = int(np.argmax(hs))
+
+    dx = np.diff(centers)
+    dy = np.diff(hs)
+
+    dx[dx == 0] = np.nan
+    slopes = dy / dx
+    angles = np.degrees(np.arctan(slopes))
+
+    min_idx = peak_idx + int(np.argmin(angles[peak_idx:]))
+
+    thr_idx = None
+    for i in range(min_idx, len(angles) - run):
+        window = angles[i:i + run]
+        if np.all(window > -angle_deg):
+            thr_idx = i + 1
+            break
+
+    if thr_idx is None:
+        return None, angles, hs, centers
+
+    thr = float(centers[thr_idx])
+    return thr, angles, hs, centers
+
+
+def texture_hist(tex_vals: np.ndarray, nbins: int = TEX_BINS):
+    tex_vals = tex_vals[np.isfinite(tex_vals)]
+    if tex_vals.size == 0:
+        return None, None
+
+    lo, hi = np.percentile(tex_vals, 1), np.percentile(tex_vals, 99)
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo = float(np.min(tex_vals))
+        hi = float(np.max(tex_vals))
+        if hi <= lo:
+            return None, None
+
+    hist, bin_edges = np.histogram(tex_vals, bins=nbins, range=(lo, hi))
+    return hist, bin_edges
+
+
+def peak_width_fwhm(hs: np.ndarray, centers: np.ndarray):
+    peak_idx = int(np.argmax(hs))
+    peak_h = float(hs[peak_idx])
+    half = 0.5 * peak_h
+
+    left = peak_idx
+    while left > 0 and hs[left] > half:
+        left -= 1
+
+    right = peak_idx
+    n = len(hs)
+    while right < n - 1 and hs[right] > half:
+        right += 1
+
+    width = float(centers[right] - centers[left])
+    return width, peak_idx, peak_h
+
+
+def compute_hist_metrics(hist: np.ndarray, hs: np.ndarray, centers: np.ndarray, thr: float):
+    # Main metrics from the main smoothed histogram (HIST_SMOOTH_K)
+    width, peak_idx, peak_h = peak_width_fwhm(hs, centers)
+    peak_x = float(centers[peak_idx])
+    sharpness = float(peak_h / width) if width > 0 else float("nan")
+
+    # Normalize raw histogram, then make a lighter-smoothed version
+    histn = hist.astype(np.float64)
+    s = histn.sum()
+    if s > 0:
+        histn /= s
+
+    hs_height = smooth_1d(histn, PEAK_HEIGHT_K)
+    rawer_peak_h = float(np.max(hs_height))
+
+    return {
+        "threshold": float(thr),
+        "peak_x": peak_x,
+        "peak_height": float(peak_h),
+        "rawer_peak_height": float(rawer_peak_h),
+        "peak_width_fwhm": float(width),
+        "peak_sharpness": float(sharpness),
+    }
+
+
+def label_mask(mask: np.ndarray, connectivity_8: bool = True):
+    if connectivity_8:
+        structure = np.ones((3, 3), dtype=np.int32)
+    else:
+        structure = np.array([[0, 1, 0],
+                              [1, 1, 1],
+                              [0, 1, 0]], dtype=np.int32)
+    return label(mask, structure=structure)
+
+
+def keep_largest_component(mask: np.ndarray, connectivity_8: bool = True):
+    lbl, n = label_mask(mask, connectivity_8)
+    if n == 0:
+        return mask & False
+    counts = np.bincount(lbl.ravel())
+    counts[0] = 0
+    keep_id = int(np.argmax(counts))
+    return lbl == keep_id
+
+
+def keep_edge_components(mask: np.ndarray, connectivity_8: bool = True):
+    lbl, n = label_mask(mask, connectivity_8)
+    if n == 0:
+        return mask & False
+    edge_ids = np.unique(np.concatenate([lbl[0, :], lbl[-1, :], lbl[:, 0], lbl[:, -1]]))
+    edge_ids = edge_ids[edge_ids != 0]
+    if edge_ids.size == 0:
+        return keep_largest_component(mask, connectivity_8)
+    return np.isin(lbl, edge_ids)
+
+
+def keep_within_x_of_largest(mask: np.ndarray, x_pixels: int, connectivity_8: bool = True):
+    L = keep_largest_component(mask, connectivity_8)
+    if not np.any(L):
+        return mask & False, None, L
+
+    dist = distance_transform_edt(~L)
+    keep = mask & (dist <= float(x_pixels))
+    return keep, dist, L
+
+
+def build_s2(mask_s: np.ndarray):
+    if S2_MODE == "edge":
+        return keep_edge_components(mask_s, CONNECTIVITY_8), None, None
+    if S2_MODE == "largest":
+        L = keep_largest_component(mask_s, CONNECTIVITY_8)
+        return L, None, L
+    return keep_within_x_of_largest(mask_s, DILATE_PIXELS, CONNECTIVITY_8)
+
+
+def _cut_dir(step: str, reason: str):
+    d = os.path.join(CUTS_DIR, step, reason)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _pass_path(filename: str) -> str:
+    return os.path.join(PASSES_DIR, filename)
+
+def save_cut_debug(frame_id: str, base: str, temp_c: np.ndarray,
+                   hist, bin_edges, thr, angles, hs, centers,
+                   step: str, reason: str):
+
+    if not SAVE_CUT_DEBUG or not frame_id:
+        return
+
+    outdir = _cut_dir(step, reason)
+
+    # ---- thermal preview from TIFF ----
+    disp = normalize_for_display(temp_c)
+
+    plt.figure(figsize=(6, 5))
+    plt.imshow(disp, cmap="gray", vmin=0.0, vmax=1.0)
+    plt.title(base)
+    plt.axis("off")
+    plt.savefig(
+        os.path.join(outdir, f"IRX_{frame_id}_thermal.png"),
+        dpi=CUT_DEBUG_DPI,
+        bbox_inches="tight"
+    )
+    plt.close()
+
+    # ---- histogram ----
+    histn = hist.astype(np.float64)
+    s = histn.sum()
+    if s > 0:
+        histn /= s
+    
+    hs_height = smooth_1d(histn, PEAK_HEIGHT_K)
+
+    plt.figure(figsize=(7, 4))
+    plt.plot(centers, histn, alpha=0.35, label="hist (norm)")
+    plt.plot(centers, hs, label=f"smoothed (k={HIST_SMOOTH_K})")
+    plt.plot(centers, hs_height, "g--", alpha=0.7, label=f"smoothed (k={PEAK_HEIGHT_K})")
+    plt.axvline(thr, linewidth=2, label="thr")
+    plt.title(f"{base}\nthr={thr:.6f}")
+    plt.xlabel("Texture (local std of °C)")
+    plt.ylabel("Probability mass")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(
+        os.path.join(outdir, f"IRX_{frame_id}_texture_hist.png"),
+        dpi=CUT_DEBUG_DPI
+    )
+    plt.close()
+
+
+def save_hist_angle_debug(frame_id: str, base: str, hist, bin_edges, thr, angles, hs, centers):
+    histn = hist.astype(np.float64)
+    if histn.sum() > 0:
+        histn /= histn.sum()
+
+    hs_height = smooth_1d(histn, PEAK_HEIGHT_K)
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(centers, histn, alpha=0.35, label="hist (norm)")
+    plt.plot(centers, hs, label=f"smoothed (k={HIST_SMOOTH_K})")
+    plt.plot(centers, hs_height, "g--", alpha=0.7, label=f"smoothed (k={PEAK_HEIGHT_K})")
+    plt.axvline(thr, linewidth=2, label="angle-knee thr")
+    plt.title(f"{base}\nAngle-knee thr={thr:.6f}  angle<{ANGLE_DEG}° run={ANGLE_RUN}")
+    plt.xlabel("Texture (local std of °C)")
+    plt.ylabel("Probability mass")
+    plt.legend()
+    plt.tight_layout()
+    out_hist = _pass_path(f"IRX_{frame_id}_texture_hist_angleknee.png")
+    plt.savefig(out_hist, dpi=160)
+    plt.close()
+
+    x = centers[1:]
+    plt.figure(figsize=(8, 4))
+    plt.plot(x, angles, label="slope angle (deg)")
+    plt.axhline(ANGLE_DEG, linestyle="--", linewidth=1, label=f"+{ANGLE_DEG}°")
+    plt.axhline(-ANGLE_DEG, linestyle="--", linewidth=1, label=f"-{ANGLE_DEG}°")
+    plt.axvline(thr, linewidth=2, label="thr")
+    plt.title(f"{base}\nAngle of smoothed hist slope (arctan(dy/dx))")
+    plt.xlabel("Texture (local std of °C)")
+    plt.ylabel("Angle (degrees)")
+    plt.legend()
+    plt.tight_layout()
+    out_ang = _pass_path(f"IRX_{frame_id}_texture_angle_angleknee.png")
+    plt.savefig(out_ang, dpi=160)
+    plt.close()
+
+
+def add_cut_kept_panel(ax, rows, metric, title, cutoff=None, cutoff_label=None):
+    kept_vals = [float(r["details"][metric]) for r in rows
+                 if r["status"] in ("processed", "baseline_skipped")
+                 and "details" in r and metric in r["details"]]
+
+    cut_vals = [float(r["details"][metric]) for r in rows
+                if r["status"] == "skipped"
+                and "details" in r and metric in r["details"]]
+
+    rng = np.random.default_rng(0)
+    y_kept = 1.0 + rng.uniform(-0.08, 0.08, size=len(kept_vals))
+    y_cut = 0.0 + rng.uniform(-0.08, 0.08, size=len(cut_vals))
+
+    if cut_vals:
+        ax.scatter(cut_vals, y_cut, s=35, alpha=0.9, label="cut")
+    if kept_vals:
+        ax.scatter(kept_vals, y_kept, s=35, alpha=0.9, label="kept")
+
+    if cutoff is not None:
+        ax.axvline(float(cutoff), linestyle="--", linewidth=1.5)
+        if cutoff_label:
+            ax.text(float(cutoff), 1.18, cutoff_label, rotation=90,
+                    va="bottom", ha="left", fontsize=8)
+
+    ax.set_title(title)
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels(["cut", "kept"])
+    ax.set_xlabel(metric)
+    ax.set_ylim(-0.45, 1.35)
+    ax.grid(axis="x", alpha=0.25)
+    ax.legend(loc="upper right")
+
+def save_1d_metrics_plot(report, output_root):
+    rows = report.get("frames", [])
+
+    metrics = [
+        ("peak_x", "Peak Position", PEAK_X_MAX, "max"),
+        ("rawer_peak_height", f"Rawer Peak Height (k={PEAK_HEIGHT_K})", PEAK_HEIGHT_MIN, "min"),
+        ("s2_over_s", "S2 / S", S2_OVER_S_MIN, "min"),
+        ("threshold", "Threshold", TEXTURE_THR_MAX, "max"),
+    ]
+
+    fig, axes = plt.subplots(len(metrics), 1, figsize=(11, 3 * len(metrics)), constrained_layout=True)
+    if len(metrics) == 1:
+        axes = [axes]
+
+    for ax, (metric, title, cutoff, kind) in zip(axes, metrics):
+        label = f"{kind}={cutoff:.4g}" if cutoff is not None else None
+        add_cut_kept_panel(ax, rows, metric, title, cutoff=cutoff, cutoff_label=label)
+
+    fig.suptitle(
+        f"1D Histogram Metric Comparison (cut vs kept)\n"
+        f"processed={report['num_processed']}, baseline_skipped={report['num_baseline_skipped']}, skipped={report['num_skipped']}",
+        fontsize=14
+    )
+
+    out_png = os.path.join(OUTPUT_ROOT, "1d_metrics_cut_vs_kept.png")
+    fig.savefig(out_png, dpi=180)
+    plt.close(fig)
+
+def save_dist_heatmap(frame_id: str, base: str, disp_gray: np.ndarray, dist: np.ndarray, L: np.ndarray):
+    if dist is None or L is None:
+        return
+
+    d = np.clip(dist, 0, DIST_HEATMAP_CLIP).astype(np.float32)
+    d_norm = d / float(DIST_HEATMAP_CLIP)
+
+    plt.figure(figsize=(8, 6))
+    plt.imshow(d_norm, cmap="magma", vmin=0.0, vmax=1.0)
+    plt.title(f"{base}\nDistance-to-largest heatmap (0..{DIST_HEATMAP_CLIP}px clipped)")
+    plt.axis("off")
+    out1 = _pass_path(f"IRX_{frame_id}_dist_to_largest_heatmap.png")
+    plt.savefig(out1, dpi=150, bbox_inches="tight")
+    plt.close()
+
+    plt.figure(figsize=(8, 6))
+    plt.imshow(disp_gray, cmap="gray", vmin=0.0, vmax=1.0)
+    plt.imshow(d_norm, cmap="magma", alpha=0.55, vmin=0.0, vmax=1.0)
+
+    outline = np.zeros((*L.shape, 4), dtype=np.float32)
+    outline[..., 0] = 0.0
+    outline[..., 1] = 1.0
+    outline[..., 2] = 1.0
+    outline[..., 3] = L.astype(np.float32) * 0.25
+    plt.imshow(outline)
+
+    plt.title(f"{base}\nDist-to-largest over thermal (magma), cyan=largest component")
+    plt.axis("off")
+    out2 = _pass_path(f"IRX_{frame_id}_dist_to_largest_on_gray.png")
+    plt.savefig(out2, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def process_one(tiff_path: str, report):
+    frame_id = find_frame_id(tiff_path)
+    base = os.path.basename(tiff_path)
+
+    with rasterio.open(tiff_path) as src:
+        raw = src.read(1)
+        if raw.dtype.kind not in ("u", "i", "f"):
+            print(f"{base}: SKIP (unexpected dtype {raw.dtype})")
+            _report_add_skip(report, frame_id, base, "unexpected_dtype", {"dtype": str(raw.dtype)}, step="read_tiff")
+            return
+
+    temp_c = to_celsius_autel(raw)
+    temp_c[(temp_c < -50) | (temp_c > 200)] = np.nan
+    finite = np.isfinite(temp_c)
+    if not np.any(finite):
+        print(f"{base}: SKIP (no finite temps)")
+        _report_add_skip(report, frame_id, base, "no_finite_temps", step="temp_sanitize")
+        return
+
+    tex = local_std_texture(temp_c, finite, TEX_WIN)
+    tex_vals = tex[finite]
+    hist, bin_edges = texture_hist(tex_vals, nbins=TEX_BINS)
+    if hist is None:
+        print(f"{base}: SKIP (texture hist failed)")
+        _report_add_skip(report, frame_id, base, "texture_hist_failed", step="texture_hist")
+        return
+
+    thr, angles, hs, centers = angle_knee_threshold(hist, bin_edges)
+
+    if thr is None:
+        step = "texture_hist_qc"
+        reason = "no_full_angle_run"
+
+        # optional: still save debug so you can inspect these failures
+        save_cut_debug(
+            frame_id, base, temp_c,
+            hist, bin_edges, 0.0,
+            angles, hs, centers,
+            step, reason
+        )
+
+        _report_add_skip(
+            report, frame_id, base, reason,
+            {
+                "angle_deg": float(ANGLE_DEG),
+                "angle_run": int(ANGLE_RUN),
+            },
+            step=step
+        )
+        return
+
+    hist_metrics = compute_hist_metrics(hist, hs, centers, thr)
+
+    # Filters
+
+    # Primary
+    if FILTERS_ENABLED.get("peak_height_min", False) and (hist_metrics["rawer_peak_height"] < PEAK_HEIGHT_MIN):
+        step = "hist_metric_qc"
+        reason = "peak_height_below_min"
+        details = dict(hist_metrics)
+        details["peak_height_min"] = float(PEAK_HEIGHT_MIN)
+
+        save_cut_debug(
+            frame_id, base, temp_c,
+            hist, bin_edges, thr,
+            angles, hs, centers,
+            step, reason
+        )
+
+        _report_add_skip(report, frame_id, base, reason, details, step=step)
+        return
+
+    # Liberal sanity check options
+
+    if FILTERS_ENABLED.get("thr_max", False) and (thr > TEXTURE_THR_MAX):
+        step = "texture_hist_qc"
+        reason = "texture_thr_above_max"
+
+        details = dict(hist_metrics)
+        details["thr_max"] = float(TEXTURE_THR_MAX)
+
+        save_cut_debug(
+            frame_id, base, temp_c,
+            hist, bin_edges, thr,
+            angles, hs, centers,
+            step, reason
+        )
+
+        _report_add_skip(report, frame_id, base, reason, details, step=step)
+        return
+    
+    if FILTERS_ENABLED.get("peak_x_max", False) and (hist_metrics["peak_x"] > PEAK_X_MAX):
+        step = "hist_metric_qc"
+        reason = "peak_x_above_max"
+        details = dict(hist_metrics)
+        details["peak_x_max"] = float(PEAK_X_MAX)
+
+        save_cut_debug(
+            frame_id, base, temp_c,
+            hist, bin_edges, thr,
+            angles, hs, centers,
+            step, reason
+        )
+
+        _report_add_skip(report, frame_id, base, reason, details, step=step)
+        return
+
+    if FILTERS_ENABLED.get("peak_width_max", False) and (hist_metrics["peak_width_fwhm"] > PEAK_WIDTH_MAX):
+        step = "hist_metric_qc"
+        reason = "peak_width_above_max"
+        details = dict(hist_metrics)
+        details["peak_width_max"] = float(PEAK_WIDTH_MAX)
+
+        save_cut_debug(
+            frame_id, base, temp_c,
+            hist, bin_edges, thr,
+            angles, hs, centers,
+            step, reason
+        )
+
+        _report_add_skip(report, frame_id, base, reason, details, step=step)
+        return
+
+    if FILTERS_ENABLED.get("peak_sharpness_min", False) and (hist_metrics["peak_sharpness"] < PEAK_SHARPNESS_MIN):
+        step = "hist_metric_qc"
+        reason = "peak_sharpness_below_min"
+        details = dict(hist_metrics)
+        details["peak_sharpness_min"] = float(PEAK_SHARPNESS_MIN)
+
+        save_cut_debug(
+            frame_id, base, temp_c,
+            hist, bin_edges, thr,
+            angles, hs, centers,
+            step, reason
+        )
+
+        _report_add_skip(report, frame_id, base, reason, details, step=step)
+        return
+
+
+    S = finite & (tex <= thr)
+    S2, dist, L = build_s2(S)
+
+    frac_finite = float(np.count_nonzero(finite))
+    s_frac = float(np.count_nonzero(S)) / frac_finite
+    s2_frac = float(np.count_nonzero(S2)) / frac_finite
+    ratio = s2_frac / s_frac if s_frac > 0 else 0.0
+
+    if FILTERS_ENABLED.get("s2_over_s_min", False) and (ratio < S2_OVER_S_MIN):
+        step = "segmentation_qc"
+        reason = "s2_over_s_below_min"
+
+        details = dict(hist_metrics)
+        details.update({
+            "s_frac": float(s_frac),
+            "s2_frac": float(s2_frac),
+            "s2_over_s": float(ratio),
+            "s2_over_s_min": float(S2_OVER_S_MIN),
+        })
+
+        save_cut_debug(
+            frame_id, base, temp_c,
+            hist, bin_edges, thr,
+            angles, hs, centers,
+            step, reason
+        )
+
+        _report_add_skip(report, frame_id, base, reason, details, step=step)
+        return
+
+    if frame_id:
+        save_hist_angle_debug(frame_id, base, hist, bin_edges, thr, angles, hs, centers)
+
+    print(base)
+    print(f"  angle_knee_thr(texture)={thr:.6f}")
+    print(f"  S  frac={s_frac:.4f}")
+    if S2_MODE == "within_x":
+        print(f"  S2 frac={s2_frac:.4f}  (mode=within_x, x={DILATE_PIXELS}px, conn={'8' if CONNECTIVITY_8 else '4'})")
+    else:
+        print(f"  S2 frac={s2_frac:.4f}  (mode={S2_MODE}, conn={'8' if CONNECTIVITY_8 else '4'})")
+
+    baseline_c = None
+    if FILTERS_ENABLED.get("s2_min_frac_baseline_skip", True) and (s2_frac < MIN_SMOOTH_FRAC):
+        print(f"  BASELINE(S2) SKIP (S2 frac < {MIN_SMOOTH_FRAC:.2f})\n")
+        
+        save_cut_debug(
+        frame_id, base, temp_c,
+        hist, bin_edges, thr,
+        angles, hs, centers,
+        step="baseline",
+        reason="s2_frac_below_min"
+        )
+
+        details = dict(hist_metrics)
+        details.update({
+            "s_frac": float(s_frac),
+            "s2_frac": float(s2_frac),
+            "s2_over_s": float(ratio),
+            "min_smooth_frac": float(MIN_SMOOTH_FRAC),
+        })
+
+        _report_add_baseline_skip(
+            report, frame_id, base,
+            "s2_frac_below_min",
+            details,
+            step="baseline"
+        )
+    else:
+        baseline_c = float(np.nanpercentile(temp_c[S2], BASELINE_PERCENTILE))
+        print(f"  BASELINE(S2) = p{BASELINE_PERCENTILE} = {baseline_c:.3f} °C\n")
+
+    disp_gray = normalize_for_display(temp_c)
+
+    outS = _pass_path(f"IRX_{frame_id}_S_on_gray.png")
+    overlay_and_save(disp_gray, S, f"{base}\nS: tex<=thr  frac={s_frac:.3f}", outS)
+
+    outS2 = _pass_path(f"IRX_{frame_id}_S2_on_gray.png")
+    
+    if S2_MODE == "within_x":
+        title = f"{base}\nS2: within {DILATE_PIXELS}px of largest  frac={s2_frac:.3f}"
+    else:
+        title = f"{base}\nS2: contiguous ({S2_MODE})  frac={s2_frac:.3f}"
+    overlay_and_save(disp_gray, S2, title, outS2)
+
+    if SAVE_DIST_HEATMAP and S2_MODE == "within_x":
+        save_dist_heatmap(frame_id, base, disp_gray, dist, L)
+
+    sgd_pixels = 0
+    sgd_frac_of_s2 = None
+    sgd_mask = None
+    diff_c = None
+
+    if baseline_c is not None:
+        diff_c = temp_c - baseline_c
+
+        band = S2 & np.isfinite(diff_c) & (np.abs(diff_c) <= BASELINE_BAND_DELTA_C)
+        sgd_mask = S2 & np.isfinite(diff_c) & (diff_c <= -SGD_MIN_DELTA_C)
+
+        sgd_pixels = int(np.count_nonzero(sgd_mask))
+        sgd_frac_of_s2 = float(sgd_pixels / np.count_nonzero(S2)) if np.count_nonzero(S2) > 0 else None
+
+        plt.figure(figsize=(8, 6))
+        plt.imshow(disp_gray, cmap="gray", vmin=0.0, vmax=1.0)
+
+        baseline_overlay = np.zeros((band.shape[0], band.shape[1], 4), dtype=np.float32)
+        baseline_overlay[..., 0] = 1.0
+        baseline_overlay[..., 3] = band.astype(np.float32) * 0.35
+
+        sgd_overlay = np.zeros((sgd_mask.shape[0], sgd_mask.shape[1], 4), dtype=np.float32)
+        sgd_overlay[..., 1] = 0.6
+        sgd_overlay[..., 2] = 1.0
+        sgd_overlay[..., 3] = sgd_mask.astype(np.float32) * 0.55
+
+        plt.imshow(baseline_overlay)
+        plt.imshow(sgd_overlay)
+
+        plt.title(
+            f"{base}\n"
+            f"Baseline p{BASELINE_PERCENTILE}(S2)={baseline_c:.2f}°C "
+            f"(red=±{BASELINE_BAND_DELTA_C}°C, light blue=SGD <= -{SGD_MIN_DELTA_C}°C)"
+        )
+        plt.axis("off")
+        plt.savefig(
+            _pass_path(f"IRX_{frame_id}_baseline_band_on_gray.png"),
+            dpi=150,
+            bbox_inches="tight"
+        )
+        plt.close()
+
+        details = dict(hist_metrics)
+        details.update({
+            "s_frac": float(s_frac),
+            "s2_frac": float(s2_frac),
+            "s2_over_s": float(ratio),
+            "baseline_percentile": int(BASELINE_PERCENTILE),
+            "baseline_c": None if baseline_c is None else float(baseline_c),
+            "tex_win": int(TEX_WIN),
+            "hist_smooth_k": int(HIST_SMOOTH_K),
+            "angle_deg": float(ANGLE_DEG),
+            "angle_run": int(ANGLE_RUN),
+            "s2_mode": str(S2_MODE),
+            "dilate_pixels": int(DILATE_PIXELS),
+            "connectivity_8": bool(CONNECTIVITY_8),
+            "sgd_min_delta_c": float(SGD_MIN_DELTA_C),
+            "sgd_pixels": int(sgd_pixels),
+            "sgd_frac_of_s2": None if sgd_frac_of_s2 is None else float(sgd_frac_of_s2),    
+        })
+
+        if baseline_c is not None:
+            _report_add_processed(report, frame_id, base, details)
+
+
+def main(flight_root: str):
+    report = _new_report()
+
+    tiffs, media_dirs = list_camera_tiffs(flight_root)
+
+    if not tiffs:
+        print(f"No camera TIFFs found under: {flight_root}")
+        if media_dirs:
+            print(f"Found {len(media_dirs)} ###MEDIA dirs (example):")
+            for d in media_dirs[:5]:
+                print(" ", d)
+        else:
+            print("No ###MEDIA dirs found; searched entire tree.")
+        any_irx = glob.glob(os.path.join(flight_root, "**", "IRX_*"), recursive=True)
+        if any_irx:
+            print("Found IRX_* paths (example):")
+            for p in sorted(any_irx)[:10]:
+                print(" ", os.path.basename(p))
+        raise SystemExit("Stopping: adjust discovery logic to match your actual filenames.")
+
+    selected = pick_evenly_spaced(tiffs, NUM_IMAGES)
+    report["num_selected"] = len(selected)
+
+    print("Selected frames:")
+    for p in selected:
+        print(" ", os.path.basename(p))
+    print("")
+
+    for p in selected:
+        process_one(p, report)
+
+    write_report(report, OUTPUT_ROOT)
+    write_text_report(report, OUTPUT_ROOT)
+    save_1d_metrics_plot(report, OUTPUT_ROOT)
+
+    print("\n=== RUN REPORT ===")
+    print(f"selected:         {report['num_selected']}")
+    print(f"processed:        {report['num_processed']}")
+    print(f"skipped:          {report['num_skipped']}")
+    print(f"baseline_skipped: {report['num_baseline_skipped']}")
+    print("skipped_by_reason:", dict(report["skipped_by_reason"]))
+    print("baseline_skipped_by_reason:", dict(report["baseline_skipped_by_reason"]))
+    print(f"report_json:      {os.path.join(OUTPUT_ROOT, 'run_report.json')}")
+    print(f"report_txt:       {os.path.join(OUTPUT_ROOT, 'run_report.txt')}")
+
+
+if __name__ == "__main__":
+    FLIGHT_ROOT = '/Volumes/EXTERNAL HD/July 2024/Autel-East of Vaihu'
+    main(FLIGHT_ROOT)
