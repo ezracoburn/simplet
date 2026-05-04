@@ -34,10 +34,10 @@ BIAS_SMOOTH_SIGMA = 30
 USE_DIRECTIONAL_BIAS = True
 
 YAW_HIST_BIN_DEG = 5
-YAW_HIST_SMOOTH_SIGMA_BINS = 3
+YAW_HIST_SMOOTH_SIGMA_BINS = 1
 YAW_PEAK_MIN_DISTANCE_DEG = 30
-YAW_PEAK_SUPPORT_WINDOW_DEG = 10
-YAW_PEAK_MIN_RAW_COUNT = 12  # should be > bias_min_count, so all peaks can build a bias field
+YAW_PEAK_SUPPORT_WINDOW_DEG = 15
+YAW_PEAK_MIN_RAW_COUNT = 12   # should be > bias_min_count, so all peaks can build a bias field
 
 
 # mask building constants

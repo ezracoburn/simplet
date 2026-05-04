@@ -10,7 +10,7 @@ from collections import Counter
 import json
 from datetime import datetime
 
-OUTPUT_ROOT = "/Users/ezracoburn/Documents/Simple/output/4-29_bursts_bc/West of Vaihu - v3"
+OUTPUT_ROOT = "/Users/ezracoburn/Documents/Simple/output/5-4_bursts_bc/West of Vaihu"
 
 BYFRAME_DIR = os.path.join(OUTPUT_ROOT, "byframe")
 PASSES_DIR = os.path.join(BYFRAME_DIR, "passes")
@@ -38,7 +38,7 @@ BIAS_SMOOTH_SIGMA = 30
 USE_DIRECTIONAL_BIAS = True
 
 YAW_HIST_BIN_DEG = 5
-YAW_HIST_SMOOTH_SIGMA_BINS = 3
+YAW_HIST_SMOOTH_SIGMA_BINS = 1
 YAW_PEAK_MIN_DISTANCE_DEG = 30
 YAW_PEAK_SUPPORT_WINDOW_DEG = 15
 YAW_PEAK_MIN_RAW_COUNT = 12  # should be > bias_min_count, so all peaks can build a bias field
