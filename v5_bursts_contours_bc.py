@@ -37,10 +37,11 @@ BIAS_MIN_COUNT = 10
 BIAS_SMOOTH_SIGMA = 30
 USE_DIRECTIONAL_BIAS = True
 
-YAW_HIST_BIN_DEG = 3
+YAW_HIST_BIN_DEG = 5
 YAW_HIST_SMOOTH_SIGMA_BINS = 3
-YAW_PEAK_MIN_DISTANCE_DEG = 45
-YAW_PEAK_MIN_HEIGHT_COUNT = 12  # should be > bias_min_count, so all peaks can build a bias field
+YAW_PEAK_MIN_DISTANCE_DEG = 30
+YAW_PEAK_SUPPORT_WINDOW_DEG = 15
+YAW_PEAK_MIN_RAW_COUNT = 12  # should be > bias_min_count, so all peaks can build a bias field
 
 # mask building constants
 MIN_SMOOTH_FRAC = 0.10
@@ -715,17 +716,29 @@ def find_yaw_histogram_peaks(yaws_deg):
         return [], hist, hs, centers
 
     min_distance_bins = max(1, int(round(YAW_PEAK_MIN_DISTANCE_DEG / YAW_HIST_BIN_DEG)))
-    
-    peaks, _ = find_peaks(
+
+    candidate_peaks, _ = find_peaks(
         hs,
-        distance=min_distance_bins,
-        height=float(YAW_PEAK_MIN_HEIGHT_COUNT)
+        distance=min_distance_bins
     )
 
-    peak_degrees = [float(centers[i] % 360.0) for i in peaks]
-    peak_degrees = sorted(peak_degrees)
+    kept_peaks = []
+    support_half_width = float(YAW_PEAK_SUPPORT_WINDOW_DEG)
 
-    return peak_degrees, hist, hs, centers
+    for i in candidate_peaks:
+        peak_deg = float(centers[i] % 360.0)
+
+        raw_support = 0
+        for c, h in zip(centers, hist):
+            if circular_distance_deg(float(c), peak_deg) <= support_half_width:
+                raw_support += int(h)
+
+        if raw_support >= YAW_PEAK_MIN_RAW_COUNT:
+            kept_peaks.append(peak_deg)
+
+    kept_peaks = sorted(kept_peaks)
+
+    return kept_peaks, hist, hs, centers
 
 
 def yaw_to_nearest_peak_bin(yaw_deg):
@@ -783,7 +796,7 @@ def save_yaw_histogram_plot(hist, hs, centers, peak_degrees):
         f"Yaw histogram peak detection\n"
         f"bin={YAW_HIST_BIN_DEG}°, smooth_sigma={YAW_HIST_SMOOTH_SIGMA_BINS} bins, "
         f"min_dist={YAW_PEAK_MIN_DISTANCE_DEG}°, "
-        f"min_height={YAW_PEAK_MIN_HEIGHT_COUNT} frames"
+        f"min_raw_height={YAW_PEAK_MIN_RAW_COUNT} frames"
     )
     plt.xlabel("Yaw (degrees)")
     plt.ylabel("Count")
@@ -951,7 +964,7 @@ def save_directional_bias_outputs(bias_bundle):
         "yaw_hist_bin_deg": int(YAW_HIST_BIN_DEG),
         "yaw_hist_smooth_sigma_bins": float(YAW_HIST_SMOOTH_SIGMA_BINS),
         "yaw_peak_min_distance_deg": float(YAW_PEAK_MIN_DISTANCE_DEG),
-        "yaw_peak_min_height_count": int(YAW_PEAK_MIN_HEIGHT_COUNT),
+        "yaw_peak_min_raw_count": int(YAW_PEAK_MIN_RAW_COUNT),
         "yaw_peak_degrees": [float(p) for p in YAW_PEAK_DEGREES],
         "usable_frames_by_dir": bias_bundle["usable_frames_by_dir"],
         "directions": {},
@@ -1339,7 +1352,7 @@ def process_one(tiff_path: str, report, bias_state=None, bias_field=None, bias_f
         "yaw_hist_bin_deg": int(YAW_HIST_BIN_DEG),
         "yaw_hist_smooth_sigma_bins": float(YAW_HIST_SMOOTH_SIGMA_BINS),
         "yaw_peak_min_distance_deg": float(YAW_PEAK_MIN_DISTANCE_DEG),
-        "yaw_peak_min_height_count": int(YAW_PEAK_MIN_HEIGHT_COUNT),
+        "yaw_peak_min_raw_count": int(YAW_PEAK_MIN_RAW_COUNT),
         "yaw_peak_degrees": [float(p) for p in YAW_PEAK_DEGREES],
     })
 
