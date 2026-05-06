@@ -1,6 +1,13 @@
 import os
 import re
 import glob
+import math
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import exifread
+from pyproj import CRS, Transformer
+
 import numpy as np
 import rasterio
 import matplotlib.pyplot as plt
@@ -24,6 +31,12 @@ os.makedirs(PASSES_DIR, exist_ok=True)
 os.makedirs(CUTS_DIR, exist_ok=True)
 os.makedirs(LAYER_DIR, exist_ok=True)
 os.makedirs(BIAS_FIELD_DIR, exist_ok=True)
+
+# georeferencing constants
+THERMAL_HFOV_DEG = 33.0
+THERMAL_VFOV_DEG = 26.0
+THERMAL_WIDTH_PX = 640
+THERMAL_HEIGHT_PX = 512
 
 BURST_SIZE = 1000
 NUM_BURSTS = 1
@@ -660,7 +673,7 @@ def save_dist_heatmap(frame_id: str, base: str, disp_gray: np.ndarray, dist: np.
 
 
 # -------------------------
-# YAW / DIRECTION HELPERS
+# GEOREFERENCING HELPERS
 # -------------------------
 
 
@@ -676,6 +689,230 @@ def find_matching_jpg(tiff_path: str):
         if os.path.exists(p):
             return p
     return None
+
+
+@dataclass(frozen=True)
+class FrameMeta:
+    lat: float
+    lon: float
+    yaw_deg: float
+    alt_agl_m: float
+    alt_msl_m: Optional[float]
+
+
+def _ratio_to_float(r) -> float:
+    return float(r.num) / float(r.den)
+
+
+def _dms_to_deg(dms, ref) -> float:
+    deg = _ratio_to_float(dms.values[0])
+    minutes = _ratio_to_float(dms.values[1])
+    seconds = _ratio_to_float(dms.values[2])
+    val = deg + minutes / 60.0 + seconds / 3600.0
+    if str(ref.values).strip() in ("S", "W"):
+        val = -val
+    return val
+
+
+_XMP_BLOCK_RE = re.compile(rb"<x:xmpmeta.*?</x:xmpmeta>", re.DOTALL)
+_FLOAT_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
+
+
+def _extract_xmp(jpg_path: str) -> bytes:
+    with open(jpg_path, "rb") as f:
+        data = f.read()
+    m = _XMP_BLOCK_RE.search(data)
+    return m.group(0) if m else b""
+
+
+def _xmp_get_float(xmp: bytes, key: str) -> Optional[float]:
+    pat = re.compile(rb"%s\s*=\s*\"([^\"]+)\"" % key.encode())
+    m = pat.search(xmp)
+    if m:
+        s = m.group(1).decode(errors="ignore")
+        fm = _FLOAT_RE.search(s)
+        return float(fm.group()) if fm else None
+    return None
+
+
+def read_frame_meta_from_jpg(jpg_path: str) -> FrameMeta:
+    with open(jpg_path, "rb") as f:
+        tags = exifread.process_file(f, details=False)
+
+    if "GPS GPSLatitude" not in tags or "GPS GPSLongitude" not in tags:
+        raise RuntimeError(f"No GPS data in {jpg_path}")
+
+    lat = _dms_to_deg(tags["GPS GPSLatitude"], tags["GPS GPSLatitudeRef"])
+    lon = _dms_to_deg(tags["GPS GPSLongitude"], tags["GPS GPSLongitudeRef"])
+
+    alt_msl = None
+    if "GPS GPSAltitude" in tags:
+        a = tags["GPS GPSAltitude"].values[0]
+        alt_msl = _ratio_to_float(a)
+
+    xmp = _extract_xmp(jpg_path)
+
+    yaw = _xmp_get_float(xmp, "Camera:Yaw")
+    alt_agl = _xmp_get_float(xmp, "Camera:AboveGroundAltitude")
+
+    if yaw is None:
+        yaw = 0.0
+
+    if alt_agl is None:
+        if alt_msl is None:
+            raise RuntimeError("No altitude found (XMP or EXIF)")
+        alt_agl = alt_msl
+
+    return FrameMeta(
+        lat=float(lat),
+        lon=float(lon),
+        yaw_deg=float(yaw),
+        alt_agl_m=float(alt_agl),
+        alt_msl_m=(float(alt_msl) if alt_msl is not None else None),
+    )
+
+
+def read_frame_meta_from_tiff(tiff_path: str):
+    jpg_path = find_matching_jpg(tiff_path)
+    if jpg_path is None:
+        return None
+
+    try:
+        return read_frame_meta_from_jpg(jpg_path)
+    except Exception:
+        return None
+
+
+def _utm_crs(lon: float, lat: float) -> CRS:
+    zone = int((lon + 180) // 6) + 1
+    return CRS.from_dict({"proj": "utm", "zone": zone, "south": lat < 0})
+
+
+def altitude_for_georef_m(meta: FrameMeta) -> float:
+    return float(meta.alt_msl_m) if meta.alt_msl_m is not None else float(meta.alt_agl_m)
+
+
+def footprint_dims_m_from_meta(meta: FrameMeta):
+    alt_m = altitude_for_georef_m(meta)
+
+    hfov = math.radians(THERMAL_HFOV_DEG)
+    vfov = math.radians(THERMAL_VFOV_DEG)
+
+    ground_w_m = 2 * alt_m * math.tan(hfov / 2)
+    ground_h_m = 2 * alt_m * math.tan(vfov / 2)
+
+    return float(ground_w_m), float(ground_h_m), float(alt_m)
+
+
+def thermal_pixel_to_lonlat(
+    x_px: float,
+    y_px: float,
+    meta: FrameMeta,
+) -> Tuple[float, float]:
+    ground_w_m, ground_h_m, _ = footprint_dims_m_from_meta(meta)
+
+    mx = ground_w_m / THERMAL_WIDTH_PX
+    my = ground_h_m / THERMAL_HEIGHT_PX
+
+    cx = (THERMAL_WIDTH_PX - 1) / 2
+    cy = (THERMAL_HEIGHT_PX - 1) / 2
+
+    dx_m = (x_px - cx) * mx
+    dy_m = (y_px - cy) * my
+
+    yaw = math.radians(meta.yaw_deg)
+
+    east_m  =  dx_m * math.cos(yaw) + dy_m * math.sin(yaw)
+    north_m = -dx_m * math.sin(yaw) + dy_m * math.cos(yaw)
+
+    utm = _utm_crs(meta.lon, meta.lat)
+    to_utm = Transformer.from_crs("EPSG:4326", utm, always_xy=True)
+    to_wgs = Transformer.from_crs(utm, "EPSG:4326", always_xy=True)
+
+    cx_m, cy_m = to_utm.transform(meta.lon, meta.lat)
+    lon, lat = to_wgs.transform(cx_m + east_m, cy_m + north_m)
+
+    return lon, lat
+
+
+def frame_footprint_lonlat(tiff_path: str):
+    meta = read_frame_meta_from_tiff(tiff_path)
+    if meta is None:
+        return None, None
+
+    pts = [
+        (0, 0),
+        (THERMAL_WIDTH_PX - 1, 0),
+        (THERMAL_WIDTH_PX - 1, THERMAL_HEIGHT_PX - 1),
+        (0, THERMAL_HEIGHT_PX - 1),
+    ]
+
+    coords = []
+
+    try:
+        for x_px, y_px in pts:
+            lon, lat = thermal_pixel_to_lonlat(x_px, y_px, meta)
+            coords.append((float(lon), float(lat)))
+    except Exception:
+        return None, meta
+
+    coords.append(coords[0])
+    return coords, meta
+
+
+def save_frame_footprints_geojson(tiffs, out_path):
+    features = []
+
+    for p in tiffs:
+        frame_id = find_frame_id(p)
+        base = os.path.basename(p)
+
+        coords, meta = frame_footprint_lonlat(p)
+        if coords is None or meta is None:
+            continue
+
+        ground_w_m, ground_h_m, alt_used_m = footprint_dims_m_from_meta(meta)
+
+        features.append({
+            "type": "Feature",
+            "properties": {
+                "frame_id": frame_id,
+                "file": base,
+                "lat": float(meta.lat),
+                "lon": float(meta.lon),
+                "yaw_deg": float(meta.yaw_deg),
+                "alt_agl_m": float(meta.alt_agl_m),
+                "alt_msl_m": None if meta.alt_msl_m is None else float(meta.alt_msl_m),
+                "alt_used_m": float(alt_used_m),
+                "altitude_mode": "MSL_ASL_if_available_else_AGL",
+                "thermal_hfov_deg": float(THERMAL_HFOV_DEG),
+                "thermal_vfov_deg": float(THERMAL_VFOV_DEG),
+                "thermal_width_px": int(THERMAL_WIDTH_PX),
+                "thermal_height_px": int(THERMAL_HEIGHT_PX),
+                "ground_w_m": float(ground_w_m),
+                "ground_h_m": float(ground_h_m),
+                "gsd_x_m": float(ground_w_m / THERMAL_WIDTH_PX),
+                "gsd_y_m": float(ground_h_m / THERMAL_HEIGHT_PX),
+            },
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [coords],
+            },
+        })
+
+    fc = {
+        "type": "FeatureCollection",
+        "features": features,
+    }
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(fc, f, indent=2)
+
+
+# -------------------------
+# YAW / DIRECTION (FOR BIAS) HELPERS
+# -------------------------
 
 
 def read_yaw_from_jpg(jpg_path: str):
@@ -1391,6 +1628,7 @@ def main(flight_root: str):
         raise SystemExit("Stopping: adjust discovery logic to match your actual filenames.")
 
     selected = pick_bursts(tiffs, BURST_SIZE, NUM_BURSTS)
+
 
     global YAW_PEAK_DEGREES
 

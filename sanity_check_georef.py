@@ -1,3 +1,4 @@
+import re
 import os
 import glob
 import math
@@ -17,8 +18,13 @@ from georef_autel_640t import (
 # OUTPUT LOCATION (FIXED)
 # =========================
 
-OUTPUT_ROOT = "/Users/ezracoburn/Documents/Simple/5-5_tongariki_grf_check"
+OUTPUT_ROOT = "/Users/ezracoburn/Documents/Simple/output/5-6_grf_check"
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
+
+
+def safe_name_from_path(path: str) -> str:
+    name = os.path.basename(os.path.normpath(path))
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", name)
 
 
 def footprint_dims_m(alt_agl_m: float) -> Tuple[float, float]:
@@ -45,8 +51,15 @@ def corners_lonlat(meta) -> List[Tuple[float, float]]:
 
 
 def main(folder: str, max_items: int = 10, write_kml: bool = True):
-    jpgs = sorted(glob.glob(os.path.join(folder, "**", "*.jpg"), recursive=True) +
-                  glob.glob(os.path.join(folder, "**", "*.JPG"), recursive=True))
+    jpgs_all = sorted(
+        glob.glob(os.path.join(folder, "**", "*.jpg"), recursive=True) +
+        glob.glob(os.path.join(folder, "**", "*.JPG"), recursive=True)
+    )
+
+    jpgs = [
+        p for p in jpgs_all
+        if re.fullmatch(r"IRX_\d{4}\.(jpg|JPG)", os.path.basename(p))
+    ]
 
     if not jpgs:
         raise SystemExit(f"No JPGs found under: {folder}")
@@ -59,7 +72,8 @@ def main(folder: str, max_items: int = 10, write_kml: bool = True):
         base = os.path.basename(jpg)
         meta = read_frame_meta_from_jpg(jpg)
 
-        w_m, h_m = footprint_dims_m(meta.alt_agl_m)
+        alt_used_m = meta.alt_msl_m if meta.alt_msl_m is not None else meta.alt_agl_m
+        w_m, h_m = footprint_dims_m(alt_used_m)
         gsdx = w_m / THERMAL_WIDTH_PX
         gsdy = h_m / THERMAL_HEIGHT_PX
 
@@ -68,7 +82,7 @@ def main(folder: str, max_items: int = 10, write_kml: bool = True):
         print(f"[{i}] {base}")
         print(f"  lat/lon: {meta.lat:.8f}, {meta.lon:.8f}")
         print(f"  yaw_deg: {meta.yaw_deg:.3f}")
-        print(f"  alt_agl_m: {meta.alt_agl_m:.3f}   (alt_msl_m: {meta.alt_msl_m})")
+        print(f"  alt_agl_m: {meta.alt_agl_m:.3f}   (alt_msl_m: {meta.alt_msl_m})   alt_used_m: {alt_used_m:.3f}")
         print(f"  footprint (m): W={w_m:.3f}  H={h_m:.3f}")
         print(f"  GSD (m/px):   X={gsdx:.4f}  Y={gsdy:.4f}")
         print("  corners (lon,lat):")
@@ -84,13 +98,14 @@ def main(folder: str, max_items: int = 10, write_kml: bool = True):
             p.style.linestyle.width = 2
 
     if kml is not None:
-        out_kml = os.path.join(OUTPUT_ROOT, "sanity_footprints.kml")
+        flight_name = safe_name_from_path(folder)
+        out_kml = os.path.join(OUTPUT_ROOT, f"sanity_footprints_{flight_name}.kml")
         kml.save(out_kml)
         print(f"Wrote KML to: {out_kml}")
 
 
 if __name__ == "__main__":
     # Change this to your flight root (the folder containing 100MEDIA/101MEDIA/etc.)
-    FLIGHT_ROOT = '/Volumes/EXTERNAL HD/Thermal Flights/1 July 23/Tongariki Clipped'
-    main(FLIGHT_ROOT, max_items=10, write_kml=True)
+    FLIGHT_ROOT = '/Volumes/EXTERNAL HD/July 2024/Autel-East of Vaihu'
+    main(FLIGHT_ROOT, max_items=1000, write_kml=True)
 
