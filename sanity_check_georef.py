@@ -17,7 +17,7 @@ from georef_autel_640t import (
 # OUTPUT LOCATION (FIXED)
 # =========================
 
-OUTPUT_ROOT = "/Users/ezracoburn/Documents/Simple/output"
+OUTPUT_ROOT = "/Users/ezracoburn/Documents/Simple/5-5_tongariki_grf_check"
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
 
@@ -91,6 +91,6 @@ def main(folder: str, max_items: int = 10, write_kml: bool = True):
 
 if __name__ == "__main__":
     # Change this to your flight root (the folder containing 100MEDIA/101MEDIA/etc.)
-    FLIGHT_ROOT = r'/Volumes/EXTERNAL HD/Thermal Flights/1 July 23/Kikirahamea - Hiva Hiva'
+    FLIGHT_ROOT = '/Volumes/EXTERNAL HD/Thermal Flights/1 July 23/Tongariki Clipped'
     main(FLIGHT_ROOT, max_items=10, write_kml=True)
 

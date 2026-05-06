@@ -10,7 +10,7 @@ from collections import Counter
 import json
 from datetime import datetime
 
-OUTPUT_ROOT = "/Users/ezracoburn/Documents/Simple/output/5-4_bursts_bc/West of Vaihu"
+OUTPUT_ROOT = "/Users/ezracoburn/Documents/Simple/output/5-5_bursts_bc/Tongariki Clipped - lowerpk"
 
 BYFRAME_DIR = os.path.join(OUTPUT_ROOT, "byframe")
 PASSES_DIR = os.path.join(BYFRAME_DIR, "passes")
@@ -39,9 +39,9 @@ USE_DIRECTIONAL_BIAS = True
 
 YAW_HIST_BIN_DEG = 5
 YAW_HIST_SMOOTH_SIGMA_BINS = 1
-YAW_PEAK_MIN_DISTANCE_DEG = 30
+YAW_PEAK_MIN_DISTANCE_DEG = 35
 YAW_PEAK_SUPPORT_WINDOW_DEG = 15
-YAW_PEAK_MIN_RAW_COUNT = 12  # should be > bias_min_count, so all peaks can build a bias field
+YAW_PEAK_MIN_RAW_COUNT = 25  # should be > bias_min_count, so all peaks can build a bias field
 
 # mask building constants
 MIN_SMOOTH_FRAC = 0.10
@@ -67,7 +67,7 @@ PEAK_HEIGHT_K = 3
 
 # histogram metric filters
 # primary filter
-PEAK_HEIGHT_MIN = 0.07 
+PEAK_HEIGHT_MIN = 0.065 
 # liberal sanity check filters
 TEXTURE_THR_MAX = 0.5
 PEAK_X_MAX = 0.15
@@ -99,9 +99,19 @@ FILTERS_ENABLED = {
 }
 
 
+def get_run_constants():
+    return {
+        name: value
+        for name, value in globals().items()
+        if name.isupper()
+        and isinstance(value, (str, int, float, bool, type(None), list, tuple, dict))
+    }
+
+
 def _new_report():
     return {
         "started_at": datetime.now().isoformat(timespec="seconds"),
+        "constants": get_run_constants(),
         "filters_enabled": dict(FILTERS_ENABLED),
         "num_selected": 0,
         "num_processed": 0,          # process_one reached the end (produced overlays)
@@ -1452,5 +1462,5 @@ def main(flight_root: str):
 
 
 if __name__ == "__main__":
-    FLIGHT_ROOT = '/Volumes/EXTERNAL HD/July 2024/Autel-West of Vaihu'
+    FLIGHT_ROOT = '/Volumes/EXTERNAL HD/Thermal Flights/1 July 23/Tongariki Clipped'
     main(FLIGHT_ROOT)
