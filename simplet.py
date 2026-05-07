@@ -7,12 +7,13 @@ from typing import Optional, Tuple
 import exifread
 
 from pyproj import CRS, Transformer
-from shapely.geometry import Polygon, mapping
+from shapely.geometry import Polygon, mapping, shape
 from shapely.ops import unary_union, transform as shapely_transform
 
 import numpy as np
 import rasterio
 from rasterio.transform import from_origin
+from rasterio.features import shapes
 import matplotlib.pyplot as plt
 from scipy.ndimage import uniform_filter, label, distance_transform_edt, gaussian_filter, median_filter, gaussian_filter1d
 from scipy.signal import find_peaks
@@ -28,6 +29,7 @@ CUTS_DIR = os.path.join(BYFRAME_DIR, "cuts")
 LAYER_DIR = os.path.join(OUTPUT_ROOT, "layers")
 BIAS_FIELD_DIR = os.path.join(OUTPUT_ROOT, "bias_field")
 RASTER_LAYER_DIR = os.path.join(LAYER_DIR, "rasters")
+POLYGON_LAYER_DIR = os.path.join(LAYER_DIR, "polygons")
 
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
 os.makedirs(BYFRAME_DIR, exist_ok=True)
@@ -36,6 +38,7 @@ os.makedirs(CUTS_DIR, exist_ok=True)
 os.makedirs(LAYER_DIR, exist_ok=True)
 os.makedirs(BIAS_FIELD_DIR, exist_ok=True)
 os.makedirs(RASTER_LAYER_DIR, exist_ok=True)
+os.makedirs(POLYGON_LAYER_DIR, exist_ok=True)
 
 # georeferencing constants
 THERMAL_HFOV_DEG = 33.0
@@ -75,9 +78,13 @@ COLD_MASK_MAX_DELTA_C = 1.0
 
 # aggregation constants
 BUILD_AGGREGATE_MASK_LAYERS = True
-AGG_GRID_RES_M = 0.5                    # should match 
+AGG_GRID_RES_M = 0.5                    # should be > max GSD (~0.3 m for our flights)
 MIN_SUPPORT_FRACTION = 0.25
 MIN_S2_SUPPORT_COUNT = 2
+
+# polygon output constants
+BUILD_AGGREGATE_POLYGONS = True
+MIN_POLYGON_AREA_M2 = 0.0
 
 # texture histogram building constants
 TEX_BINS = 256
@@ -87,7 +94,7 @@ TEX_WIN = 9
     # Main smoothing (HIST_SMOOTH_K) is used for thresholding and stable peak geometry.
     # A lighter smoothing (PEAK_HEIGHT_K) is used only to compute rawer_peak_height,
     # which is intended to be a more sensitive QC metric for tall/narrow ocean peaks.
-    # kernel must be even
+    # kernel must be odd
 HIST_SMOOTH_K = 7 
 ANGLE_DEG = 0.7
 ANGLE_RUN = 6
@@ -126,6 +133,11 @@ FILTERS_ENABLED = {
     "s2_min_frac_baseline_skip": True,
     "s2_over_s_min": True,
 }
+
+
+# -------------------------
+# REPORTING HELPERS
+# -------------------------
 
 
 def get_run_constants():
@@ -234,6 +246,11 @@ def write_text_report(report, output_root):
                     f.write(f"      {name}\n")
 
 
+# -------------------------
+# FILE DISCOVERY / SELECTION HELPERS
+# -------------------------
+
+
 def find_frame_id(path: str):
     m = re.search(r"IRX_(\d{4})", os.path.basename(path))
     return m.group(1) if m else None
@@ -304,6 +321,11 @@ def pick_bursts(items, burst_size: int, num_bursts: int):
     return selected
 
 
+# -------------------------
+# TEMPERATURE / DISPLAY HELPERS
+# -------------------------
+
+
 def to_celsius_autel(raw: np.ndarray) -> np.ndarray:
     return raw.astype(np.float32) * 0.1 - 273.15
 
@@ -332,6 +354,11 @@ def overlay_and_save(background, mask, title, out_path, alpha=0.45):
     plt.axis("off")
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
+
+
+# -------------------------
+# TEXTURE / HISTOGRAM HELPERS
+# -------------------------
 
 
 def local_std_texture(temp_c: np.ndarray, finite: np.ndarray, win: int = 9):
@@ -452,6 +479,11 @@ def compute_hist_metrics(hist: np.ndarray, hs: np.ndarray, centers: np.ndarray, 
     }
 
 
+# -------------------------
+# MASK CONSTRUCTION HELPERS
+# -------------------------
+
+
 def label_mask(mask: np.ndarray, connectivity_8: bool = True):
     if connectivity_8:
         structure = np.ones((3, 3), dtype=np.int32)
@@ -524,13 +556,20 @@ def build_cumulative_cold_masks(diff_c: np.ndarray, s2_mask: np.ndarray):
     return valid, masks
 
 
+# -------------------------
+# CUT / PASS DEBUG OUTPUT HELPERS
+# -------------------------
+
+
 def _cut_dir(step: str, reason: str):
     d = os.path.join(CUTS_DIR, step, reason)
     os.makedirs(d, exist_ok=True)
     return d
 
+
 def _pass_path(filename: str) -> str:
     return os.path.join(PASSES_DIR, filename)
+
 
 def save_cut_debug(frame_id: str, base: str, temp_c: np.ndarray,
                    hist, bin_edges, thr, angles, hs, centers,
@@ -649,6 +688,7 @@ def add_cut_kept_panel(ax, rows, metric, title, cutoff=None, cutoff_label=None):
     ax.grid(axis="x", alpha=0.25)
     ax.legend(loc="upper right")
 
+
 def save_1d_metrics_plot(report, output_root):
     rows = report.get("frames", [])
 
@@ -676,6 +716,7 @@ def save_1d_metrics_plot(report, output_root):
     out_png = os.path.join(OUTPUT_ROOT, "1d_metrics_cut_vs_kept.png")
     fig.savefig(out_png, dpi=180)
     plt.close(fig)
+
 
 def save_dist_heatmap(frame_id: str, base: str, disp_gray: np.ndarray, dist: np.ndarray, L: np.ndarray):
     if dist is None or L is None:
@@ -1003,7 +1044,7 @@ def save_total_flight_footprint_geojson(tiffs, out_path):
 
 
 # -------------------------
-# MASK AGGREGATION HELPERS
+# RASTER MASK AGGREGATION HELPERS
 # -------------------------
 
 
@@ -1357,7 +1398,167 @@ def summarize_aggregate_masks(mask_agg):
 
 
 # -------------------------
-# BIAS FIELD YAW HELPERS 
+# POLYGON CREATION HELPERS 
+# -------------------------
+
+
+def mask_to_union_polygon_wgs(mask, grid, min_area_m2=0.0):
+    mask_u8 = mask.astype(np.uint8)
+
+    polys_utm = []
+
+    for geom, value in shapes(
+        mask_u8,
+        mask=mask_u8.astype(bool),
+        transform=grid["transform"]
+    ):
+        if int(value) != 1:
+            continue
+
+        poly = shape(geom)
+
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+
+        if poly.is_empty:
+            continue
+
+        if min_area_m2 > 0.0 and poly.area < min_area_m2:
+            continue
+
+        polys_utm.append(poly)
+
+    if not polys_utm:
+        return None, 0, 0.0
+
+    union_utm = unary_union(polys_utm)
+
+    if not union_utm.is_valid:
+        union_utm = union_utm.buffer(0)
+
+    area_m2 = float(union_utm.area)
+
+    to_wgs = Transformer.from_crs(grid["crs"], "EPSG:4326", always_xy=True)
+
+    def _to_lonlat(x, y, z=None):
+        return to_wgs.transform(x, y)
+
+    union_wgs = shapely_transform(_to_lonlat, union_utm)
+
+    return union_wgs, len(polys_utm), area_m2
+
+
+def write_polygon_geojson(path, geometry, properties):
+    if geometry is None or geometry.is_empty:
+        fc = {
+            "type": "FeatureCollection",
+            "features": [],
+        }
+    else:
+        fc = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": properties,
+                    "geometry": mapping(geometry),
+                }
+            ],
+        }
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(fc, f, indent=2)
+
+
+def save_aggregate_polygons(mask_agg):
+    if mask_agg is None:
+        return {}
+
+    grid = mask_agg["grid"]
+    s2_count = mask_agg["s2_count"]
+
+    polygon_summary = {
+        "min_polygon_area_m2": float(MIN_POLYGON_AREA_M2),
+        "layers": {},
+    }
+
+    valid_s2 = s2_count >= MIN_S2_SUPPORT_COUNT
+
+    s2_geom, s2_region_count, s2_area_m2 = mask_to_union_polygon_wgs(
+        valid_s2,
+        grid,
+        min_area_m2=MIN_POLYGON_AREA_M2
+    )
+
+    s2_path = os.path.join(POLYGON_LAYER_DIR, "s2_coverage_valid.geojson")
+
+    write_polygon_geojson(
+        s2_path,
+        s2_geom,
+        {
+            "layer": "s2_coverage_valid",
+            "min_s2_support_count": int(MIN_S2_SUPPORT_COUNT),
+            "region_count_before_union": int(s2_region_count),
+            "area_m2": float(s2_area_m2),
+        }
+    )
+
+    polygon_summary["layers"]["s2_coverage_valid"] = {
+        "path": s2_path,
+        "region_count_before_union": int(s2_region_count),
+        "area_m2": float(s2_area_m2),
+    }
+
+    for delta_c, cold_count in mask_agg["cold_counts"].items():
+        label = threshold_label(delta_c)
+
+        fraction = np.full(s2_count.shape, np.nan, dtype=np.float32)
+        ok = s2_count > 0
+        fraction[ok] = cold_count[ok].astype(np.float32) / s2_count[ok].astype(np.float32)
+
+        final_mask = (
+            valid_s2
+            & np.isfinite(fraction)
+            & (fraction >= MIN_SUPPORT_FRACTION)
+        )
+
+        geom, region_count, area_m2 = mask_to_union_polygon_wgs(
+            final_mask,
+            grid,
+            min_area_m2=MIN_POLYGON_AREA_M2
+        )
+
+        out_path = os.path.join(
+            POLYGON_LAYER_DIR,
+            f"cold_{label}_final.geojson"
+        )
+
+        write_polygon_geojson(
+            out_path,
+            geom,
+            {
+                "layer": f"cold_{label}_final",
+                "delta_c": float(delta_c),
+                "min_support_fraction": float(MIN_SUPPORT_FRACTION),
+                "min_s2_support_count": int(MIN_S2_SUPPORT_COUNT),
+                "region_count_before_union": int(region_count),
+                "area_m2": float(area_m2),
+            }
+        )
+
+        polygon_summary["layers"][f"cold_{label}_final"] = {
+            "path": out_path,
+            "delta_c": float(delta_c),
+            "region_count_before_union": int(region_count),
+            "area_m2": float(area_m2),
+        }
+
+    return polygon_summary
+
+
+# -------------------------
+# BIAS FIELD YAW GROUPING HELPERS 
 # -------------------------
 
 
@@ -1502,7 +1703,7 @@ def save_yaw_histogram_plot(hist, hs, centers, peak_degrees):
 
 
 # -------------------------
-# BIAS FIELD HELPERS
+# BIAS FIELD CONSTRUCTION HELPERS
 # -------------------------
 
 
@@ -1708,6 +1909,11 @@ def choose_bias_for_frame(tiff_path, bias_bundle):
         return bias_bundle["global"]["smooth"], f"global_fallback_for_{direction}"
 
     return bias_bundle["global"]["smooth"], "global"
+
+
+# -------------------------
+# FRAME PROCESSING
+# -------------------------
 
 
 def process_one(tiff_path: str, report, bias_state=None, bias_field=None, bias_field_name=None, mask_agg=None, save_outputs=True):
@@ -2096,6 +2302,11 @@ def process_one(tiff_path: str, report, bias_state=None, bias_field=None, bias_f
         _report_add_processed(report, frame_id, base, details)
 
 
+# -------------------------
+# MAIN DRIVER
+# -------------------------
+
+
 def main(flight_root: str):
     report = _new_report()
 
@@ -2198,6 +2409,12 @@ def main(flight_root: str):
         print("Saving aggregate raster layers...")
         save_aggregate_rasters(mask_agg)
 
+    aggregate_polygon_summary = {}
+
+    if mask_agg is not None and BUILD_AGGREGATE_POLYGONS:
+        print("Saving aggregate polygon layers...")
+        aggregate_polygon_summary = save_aggregate_polygons(mask_agg)
+
     if mask_agg is not None:
         report["mask_aggregation"] = {
             "num_frames_added": int(mask_agg["num_frames_added"]),
@@ -2214,7 +2431,9 @@ def main(flight_root: str):
             "min_support_fraction": float(MIN_SUPPORT_FRACTION),
             "min_s2_support_count": int(MIN_S2_SUPPORT_COUNT),
         }
+        
         report["aggregate_threshold_summary"] = summarize_aggregate_masks(mask_agg)
+        report["aggregate_polygon_summary"] = aggregate_polygon_summary
 
     write_report(report, OUTPUT_ROOT)
     write_text_report(report, OUTPUT_ROOT)
