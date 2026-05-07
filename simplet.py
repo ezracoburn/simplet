@@ -21,7 +21,7 @@ from collections import Counter
 import json
 from datetime import datetime
 
-OUTPUT_ROOT = "/Users/ezracoburn/Documents/Simple/output/5-5_bursts_bc/Tongariki Clipped - lowerpk"
+OUTPUT_ROOT = "/Users/ezracoburn/Documents/Simple/output/5-7/East of Vaihu"
 
 BYFRAME_DIR = os.path.join(OUTPUT_ROOT, "byframe")
 PASSES_DIR = os.path.join(BYFRAME_DIR, "passes")
@@ -111,16 +111,16 @@ PEAK_X_MAX = 0.15
 PEAK_WIDTH_MAX = 0.2
 PEAK_SHARPNESS_MIN = 0.1
 
-SAVE_CUT_DEBUG = True
-CUT_DEBUG_DPI = 120
-
 # S2 mode: keep only pixels within X pixels of the largest component
 S2_MODE = "largest"      # "largest" | "edge" | "within_x"
 CONNECTIVITY_8 = True
-
 DILATE_PIXELS = 0        # X pixels: keep S pixels with distance-to-largest <= X
 
 # Optional debug output
+VERBOSE_FRAME_LOGS = False
+SPINNER_CHARS = ["|", "/", "-", "\\"]
+SAVE_CUT_DEBUG = True
+CUT_DEBUG_DPI = 120
 SAVE_DIST_HEATMAP = False
 DIST_HEATMAP_CLIP = 30   # clip distances for visualization (pixels)
                          #CANNOT SET TO 0 (runtime)
@@ -245,6 +245,26 @@ def write_text_report(report, output_root):
                 f.write(f"  - {reason}: {len(files)}\n")
                 for name in files:
                     f.write(f"      {name}\n")
+
+
+def print_progress_bar(label, current, total, width=36):
+    if total <= 0:
+        return
+
+    frac = current / total
+    filled = int(width * frac)
+    bar = "█" * filled + "░" * (width - filled)
+
+    spinner = SPINNER_CHARS[current % len(SPINNER_CHARS)]
+
+    print(
+        f"\r{spinner} {label}: |{bar}| {current}/{total} ({frac * 100:5.1f}%)",
+        end="",
+        flush=True
+    )
+
+    if current >= total:
+        print("")
 
 
 # -------------------------
@@ -2136,13 +2156,14 @@ def process_one(tiff_path: str, report, bias_state=None, bias_field=None, bias_f
     if save_outputs and frame_id:
         save_hist_angle_debug(frame_id, base, hist, bin_edges, thr, angles, hs, centers)
 
-    print(base)
-    print(f"  angle_knee_thr(texture)={thr:.6f}")
-    print(f"  S  frac={s_frac:.4f}")
-    if S2_MODE == "within_x":
-        print(f"  S2 frac={s2_frac:.4f}  (mode=within_x, x={DILATE_PIXELS}px, conn={'8' if CONNECTIVITY_8 else '4'})")
-    else:
-        print(f"  S2 frac={s2_frac:.4f}  (mode={S2_MODE}, conn={'8' if CONNECTIVITY_8 else '4'})")
+    if VERBOSE_FRAME_LOGS:
+        print(base)
+        print(f"  angle_knee_thr(texture)={thr:.6f}")
+        print(f"  S  frac={s_frac:.4f}")
+        if S2_MODE == "within_x":
+            print(f"  S2 frac={s2_frac:.4f}  (mode=within_x, x={DILATE_PIXELS}px, conn={'8' if CONNECTIVITY_8 else '4'})")
+        else:
+            print(f"  S2 frac={s2_frac:.4f}  (mode={S2_MODE}, conn={'8' if CONNECTIVITY_8 else '4'})")
 
     analysis_temp_c = temp_c
     bias_correction_applied = False
@@ -2155,8 +2176,9 @@ def process_one(tiff_path: str, report, bias_state=None, bias_field=None, bias_f
 
     baseline_c = None
     if FILTERS_ENABLED.get("s2_min_frac_baseline_skip", True) and (s2_frac < MIN_SMOOTH_FRAC):
-        print(f"  BASELINE(S2) SKIP (S2 frac < {MIN_SMOOTH_FRAC:.2f})\n")
-        
+        if VERBOSE_FRAME_LOGS:
+            print(f"  BASELINE(S2) SKIP (S2 frac < {MIN_SMOOTH_FRAC:.2f})\n")
+            
         save_cut_debug(
         frame_id, base, temp_c,
         hist, bin_edges, thr,
@@ -2181,7 +2203,8 @@ def process_one(tiff_path: str, report, bias_state=None, bias_field=None, bias_f
         )
     else:
         baseline_c = float(np.nanpercentile(analysis_temp_c[S2], BASELINE_PERCENTILE))
-        print(f"  BASELINE(S2) = p{BASELINE_PERCENTILE} = {baseline_c:.3f} °C\n")
+        if VERBOSE_FRAME_LOGS:
+            print(f"  BASELINE(S2) = p{BASELINE_PERCENTILE} = {baseline_c:.3f} °C\n")
 
     disp_gray = normalize_for_display(analysis_temp_c)
 
@@ -2425,7 +2448,11 @@ def main(flight_root: str):
     report = _new_report()
     report["num_selected"] = len(selected)
 
-    for p in selected:
+    total_selected = len(selected)
+
+    for i, p in enumerate(selected, start=1):
+        print_progress_bar("Processing / aggregating frames", i - 1, total_selected)
+
         frame_bias, frame_bias_name = choose_bias_for_frame(p, bias_bundle)
 
         process_one(
@@ -2437,6 +2464,8 @@ def main(flight_root: str):
             mask_agg=mask_agg,
             save_outputs=True,
         )
+
+    print_progress_bar("Processing / aggregating frames", i, total_selected)
 
     if mask_agg is not None:
         print("Saving aggregate raster layers...")
@@ -2484,5 +2513,5 @@ def main(flight_root: str):
 
 
 if __name__ == "__main__":
-    FLIGHT_ROOT = '/Volumes/EXTERNAL HD/Thermal Flights/1 July 23/Tongariki Clipped'
+    FLIGHT_ROOT = '/Volumes/EXTERNAL HD/July 2024/Autel-East of Vaihu'
     main(FLIGHT_ROOT)
