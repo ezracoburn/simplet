@@ -106,6 +106,6 @@ def main(folder: str, max_items: int = 10, write_kml: bool = True):
 
 if __name__ == "__main__":
     # Change this to your flight root (the folder containing 100MEDIA/101MEDIA/etc.)
-    FLIGHT_ROOT = '/Volumes/EXTERNAL HD/July 2024/Autel-East of Vaihu'
+    FLIGHT_ROOT = '/Volumes/EXTERNAL HD/July 2024/Autel-West of Akahanga'
     main(FLIGHT_ROOT, max_items=1000, write_kml=True)
 

@@ -4,12 +4,15 @@ import glob
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
-
 import exifread
+
 from pyproj import CRS, Transformer
+from shapely.geometry import Polygon, mapping
+from shapely.ops import unary_union, transform as shapely_transform
 
 import numpy as np
 import rasterio
+from rasterio.transform import from_origin
 import matplotlib.pyplot as plt
 from scipy.ndimage import uniform_filter, label, distance_transform_edt, gaussian_filter, median_filter, gaussian_filter1d
 from scipy.signal import find_peaks
@@ -24,6 +27,7 @@ PASSES_DIR = os.path.join(BYFRAME_DIR, "passes")
 CUTS_DIR = os.path.join(BYFRAME_DIR, "cuts")
 LAYER_DIR = os.path.join(OUTPUT_ROOT, "layers")
 BIAS_FIELD_DIR = os.path.join(OUTPUT_ROOT, "bias_field")
+RASTER_LAYER_DIR = os.path.join(LAYER_DIR, "rasters")
 
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
 os.makedirs(BYFRAME_DIR, exist_ok=True)
@@ -31,6 +35,7 @@ os.makedirs(PASSES_DIR, exist_ok=True)
 os.makedirs(CUTS_DIR, exist_ok=True)
 os.makedirs(LAYER_DIR, exist_ok=True)
 os.makedirs(BIAS_FIELD_DIR, exist_ok=True)
+os.makedirs(RASTER_LAYER_DIR, exist_ok=True)
 
 # georeferencing constants
 THERMAL_HFOV_DEG = 33.0
@@ -62,6 +67,17 @@ S2_OVER_S_MIN = 0.8
 BASELINE_PERCENTILE = 90
 BASELINE_BAND_DELTA_C = 0.1
 CONTOUR_STEP_C = 0.25
+
+# cumulative cold-mask aggregation constants
+BUILD_CUMULATIVE_COLD_MASKS = True
+COLD_MASK_MIN_DELTA_C = 0.25
+COLD_MASK_MAX_DELTA_C = 1.0
+
+# aggregation constants
+BUILD_AGGREGATE_MASK_LAYERS = True
+AGG_GRID_RES_M = 0.5                    # should match 
+MIN_SUPPORT_FRACTION = 0.25
+MIN_S2_SUPPORT_COUNT = 2
 
 # texture histogram building constants
 TEX_BINS = 256
@@ -484,6 +500,28 @@ def build_s2(mask_s: np.ndarray):
         L = keep_largest_component(mask_s, CONNECTIVITY_8)
         return L, None, L
     return keep_within_x_of_largest(mask_s, DILATE_PIXELS, CONNECTIVITY_8)
+
+
+def cold_threshold_values():
+    n_steps = int(np.floor(COLD_MASK_MAX_DELTA_C / COLD_MASK_MIN_DELTA_C))
+    return [
+        round(i * COLD_MASK_MIN_DELTA_C, 2)
+        for i in range(1, n_steps + 1)
+    ]
+
+
+def threshold_label(delta_c: float):
+    return f"{delta_c:.2f}".replace(".", "p")
+
+
+def build_cumulative_cold_masks(diff_c: np.ndarray, s2_mask: np.ndarray):
+    valid = s2_mask & np.isfinite(diff_c)
+
+    masks = {}
+    for delta_c in cold_threshold_values():
+        masks[delta_c] = valid & (diff_c <= -float(delta_c))
+
+    return valid, masks
 
 
 def _cut_dir(step: str, reason: str):
@@ -910,8 +948,416 @@ def save_frame_footprints_geojson(tiffs, out_path):
         json.dump(fc, f, indent=2)
 
 
+def save_total_flight_footprint_geojson(tiffs, out_path):
+    utm_crs = utm_crs_for_tiffs(tiffs)
+    if utm_crs is None:
+        print("  WARNING: could not save flight footprint; no usable UTM CRS.")
+        return
+
+    footprint_polys = []
+
+    for p in tiffs:
+        coords_utm = frame_footprint_utm(p, utm_crs)
+        if coords_utm is None:
+            continue
+
+        poly = Polygon(coords_utm)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+
+        if not poly.is_empty:
+            footprint_polys.append(poly)
+
+    if not footprint_polys:
+        print("  WARNING: could not save flight footprint; no valid footprints.")
+        return
+
+    union_utm = unary_union(footprint_polys)
+
+    to_wgs = Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
+
+    def _to_lonlat(x, y, z=None):
+        return to_wgs.transform(x, y)
+
+    union_wgs = shapely_transform(_to_lonlat, union_utm)
+
+    feature = {
+        "type": "Feature",
+        "properties": {
+            "num_frames": int(len(tiffs)),
+            "num_footprints_used": int(len(footprint_polys)),
+            "crs_source": str(utm_crs),
+            "altitude_mode": "MSL_ASL_if_available_else_AGL",
+        },
+        "geometry": mapping(union_wgs),
+    }
+
+    fc = {
+        "type": "FeatureCollection",
+        "features": [feature],
+    }
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(fc, f, indent=2)
+
+
 # -------------------------
-# YAW / DIRECTION (FOR BIAS) HELPERS
+# MASK AGGREGATION HELPERS
+# -------------------------
+
+
+def utm_crs_for_tiffs(tiffs):
+    for p in tiffs:
+        meta = read_frame_meta_from_tiff(p)
+        if meta is not None:
+            return _utm_crs(meta.lon, meta.lat)
+    return None
+
+
+def frame_footprint_utm(tiff_path: str, utm_crs):
+    meta = read_frame_meta_from_tiff(tiff_path)
+    if meta is None:
+        return None
+
+    to_utm = Transformer.from_crs("EPSG:4326", utm_crs, always_xy=True)
+
+    pts = [
+        (0, 0),
+        (THERMAL_WIDTH_PX - 1, 0),
+        (THERMAL_WIDTH_PX - 1, THERMAL_HEIGHT_PX - 1),
+        (0, THERMAL_HEIGHT_PX - 1),
+    ]
+
+    coords = []
+
+    try:
+        for x_px, y_px in pts:
+            lon, lat = thermal_pixel_to_lonlat(x_px, y_px, meta)
+            x_m, y_m = to_utm.transform(lon, lat)
+            coords.append((float(x_m), float(y_m)))
+    except Exception:
+        return None
+
+    return coords
+
+
+def aggregate_bounds_from_tiffs(tiffs, utm_crs):
+    xs = []
+    ys = []
+
+    for p in tiffs:
+        coords = frame_footprint_utm(p, utm_crs)
+        if coords is None:
+            continue
+
+        for x, y in coords:
+            xs.append(x)
+            ys.append(y)
+
+    if not xs or not ys:
+        return None
+
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def make_aggregate_grid(tiffs, res_m):
+    utm_crs = utm_crs_for_tiffs(tiffs)
+    if utm_crs is None:
+        return None
+
+    bounds = aggregate_bounds_from_tiffs(tiffs, utm_crs)
+    if bounds is None:
+        return None
+
+    min_x, min_y, max_x, max_y = bounds
+
+    pad = 5.0 * res_m
+    min_x -= pad
+    min_y -= pad
+    max_x += pad
+    max_y += pad
+
+    width = int(np.ceil((max_x - min_x) / res_m))
+    height = int(np.ceil((max_y - min_y) / res_m))
+
+    transform = from_origin(min_x, max_y, res_m, res_m)
+
+    return {
+        "crs": utm_crs,
+        "transform": transform,
+        "min_x": float(min_x),
+        "max_y": float(max_y),
+        "width": int(width),
+        "height": int(height),
+        "res_m": float(res_m),
+    }
+
+
+def init_mask_aggregator(tiffs):
+    grid = make_aggregate_grid(tiffs, AGG_GRID_RES_M)
+    if grid is None:
+        return None
+
+    return {
+        "grid": grid,
+        "s2_count": np.zeros((grid["height"], grid["width"]), dtype=np.uint16),
+        "cold_counts": {
+            float(delta_c): np.zeros((grid["height"], grid["width"]), dtype=np.uint16)
+            for delta_c in cold_threshold_values()
+        },
+        "num_frames_added": 0,
+        "num_frames_skipped": 0,
+    }
+
+
+def pixel_centers_to_agg_indices(tiff_path: str, mask_shape, agg):
+    meta = read_frame_meta_from_tiff(tiff_path)
+    if meta is None or agg is None:
+        return None, None, None
+
+    h, w = mask_shape
+    grid = agg["grid"]
+
+    to_utm = Transformer.from_crs("EPSG:4326", grid["crs"], always_xy=True)
+    center_x_m, center_y_m = to_utm.transform(meta.lon, meta.lat)
+
+    ground_w_m, ground_h_m, _ = footprint_dims_m_from_meta(meta)
+
+    mx = ground_w_m / THERMAL_WIDTH_PX
+    my = ground_h_m / THERMAL_HEIGHT_PX
+
+    cx = (THERMAL_WIDTH_PX - 1) / 2.0
+    cy = (THERMAL_HEIGHT_PX - 1) / 2.0
+
+    rows = np.arange(h, dtype=np.float64)
+    cols = np.arange(w, dtype=np.float64)
+    col_grid, row_grid = np.meshgrid(cols, rows)
+
+    dx_m = (col_grid - cx) * mx
+    dy_m = (row_grid - cy) * my
+
+    yaw = math.radians(meta.yaw_deg)
+
+    east_m = dx_m * math.cos(yaw) + dy_m * math.sin(yaw)
+    north_m = -dx_m * math.sin(yaw) + dy_m * math.cos(yaw)
+
+    xs = center_x_m + east_m
+    ys = center_y_m + north_m
+
+    agg_cols = np.floor((xs - grid["min_x"]) / grid["res_m"]).astype(np.int32)
+    agg_rows = np.floor((grid["max_y"] - ys) / grid["res_m"]).astype(np.int32)
+
+    in_bounds = (
+        (agg_rows >= 0) &
+        (agg_rows < grid["height"]) &
+        (agg_cols >= 0) &
+        (agg_cols < grid["width"])
+    )
+
+    return agg_rows, agg_cols, in_bounds
+
+
+def add_masks_to_aggregator(agg, tiff_path, s2_coverage_mask, cumulative_cold_masks):
+    if agg is None:
+        return False
+
+    if s2_coverage_mask is None or cumulative_cold_masks is None:
+        agg["num_frames_skipped"] += 1
+        return False
+
+    agg_rows, agg_cols, in_bounds = pixel_centers_to_agg_indices(
+        tiff_path,
+        s2_coverage_mask.shape,
+        agg
+    )
+
+    if agg_rows is None:
+        agg["num_frames_skipped"] += 1
+        return False
+
+    width = agg["grid"]["width"]
+
+    # S2 coverage: one vote per frame per aggregate cell
+    s2_valid = s2_coverage_mask & in_bounds
+
+    if np.any(s2_valid):
+        s2_linear = agg_rows[s2_valid] * width + agg_cols[s2_valid]
+        s2_unique = np.unique(s2_linear)
+        agg["s2_count"].ravel()[s2_unique] += 1
+
+    # Cold masks: one vote per frame per aggregate cell per threshold
+    for delta_c, mask in cumulative_cold_masks.items():
+        delta_c = float(delta_c)
+
+        if delta_c not in agg["cold_counts"]:
+            continue
+
+        cold_valid = mask & in_bounds
+
+        if not np.any(cold_valid):
+            continue
+
+        cold_linear = agg_rows[cold_valid] * width + agg_cols[cold_valid]
+        cold_unique = np.unique(cold_linear)
+        agg["cold_counts"][delta_c].ravel()[cold_unique] += 1
+
+    agg["num_frames_added"] += 1
+    return True
+
+
+def write_geotiff(path, array, grid, dtype=None, nodata=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    arr = array
+    if dtype is not None:
+        arr = arr.astype(dtype)
+
+    profile = {
+        "driver": "GTiff",
+        "height": int(grid["height"]),
+        "width": int(grid["width"]),
+        "count": 1,
+        "dtype": arr.dtype,
+        "crs": grid["crs"],
+        "transform": grid["transform"],
+        "compress": "deflate",
+    }
+
+    if nodata is not None:
+        profile["nodata"] = nodata
+
+    with rasterio.open(path, "w", **profile) as dst:
+        dst.write(arr, 1)
+
+
+def save_aggregate_rasters(mask_agg):
+    if mask_agg is None:
+        return
+
+    grid = mask_agg["grid"]
+    s2_count = mask_agg["s2_count"]
+
+    write_geotiff(
+        os.path.join(RASTER_LAYER_DIR, "s2_count.tif"),
+        s2_count,
+        grid,
+        dtype=np.uint16,
+        nodata=0
+    )
+
+    valid_s2 = s2_count >= MIN_S2_SUPPORT_COUNT
+
+    for delta_c, cold_count in mask_agg["cold_counts"].items():
+        label = threshold_label(delta_c)
+
+        cold_count_path = os.path.join(
+            RASTER_LAYER_DIR,
+            f"cold_{label}_count.tif"
+        )
+
+        fraction_path = os.path.join(
+            RASTER_LAYER_DIR,
+            f"cold_{label}_fraction.tif"
+        )
+
+        final_mask_path = os.path.join(
+            RASTER_LAYER_DIR,
+            f"cold_{label}_final_mask.tif"
+        )
+
+        write_geotiff(
+            cold_count_path,
+            cold_count,
+            grid,
+            dtype=np.uint16,
+            nodata=0
+        )
+
+        fraction = np.full(s2_count.shape, np.nan, dtype=np.float32)
+        ok = s2_count > 0
+        fraction[ok] = cold_count[ok].astype(np.float32) / s2_count[ok].astype(np.float32)
+
+        write_geotiff(
+            fraction_path,
+            fraction,
+            grid,
+            dtype=np.float32,
+            nodata=np.nan
+        )
+
+        final_mask = (
+            valid_s2
+            & np.isfinite(fraction)
+            & (fraction >= MIN_SUPPORT_FRACTION)
+        )
+
+        write_geotiff(
+            final_mask_path,
+            final_mask.astype(np.uint8),
+            grid,
+            dtype=np.uint8,
+            nodata=0
+        )
+
+
+def summarize_aggregate_masks(mask_agg):
+    if mask_agg is None:
+        return {}
+
+    grid = mask_agg["grid"]
+    cell_area_m2 = float(grid["res_m"] ** 2)
+
+    s2_count = mask_agg["s2_count"]
+    observed = s2_count > 0
+    valid_s2 = s2_count >= MIN_S2_SUPPORT_COUNT
+
+    summary = {
+        "cell_area_m2": cell_area_m2,
+        "observed_cell_count": int(np.count_nonzero(observed)),
+        "observed_area_m2": float(np.count_nonzero(observed) * cell_area_m2),
+        "valid_s2_cell_count": int(np.count_nonzero(valid_s2)),
+        "valid_s2_area_m2": float(np.count_nonzero(valid_s2) * cell_area_m2),
+        "max_s2_count": int(np.max(s2_count)) if s2_count.size else 0,
+        "thresholds": {},
+    }
+
+    for delta_c, cold_count in mask_agg["cold_counts"].items():
+        label = threshold_label(delta_c)
+
+        fraction = np.full(s2_count.shape, np.nan, dtype=np.float32)
+        ok = s2_count > 0
+        fraction[ok] = cold_count[ok].astype(np.float32) / s2_count[ok].astype(np.float32)
+
+        final_mask = (
+            valid_s2
+            & np.isfinite(fraction)
+            & (fraction >= MIN_SUPPORT_FRACTION)
+        )
+
+        cold_observed = cold_count > 0
+
+        summary["thresholds"][label] = {
+            "delta_c": float(delta_c),
+            "cold_observation_count": int(np.sum(cold_count)),
+            "cold_observed_cell_count": int(np.count_nonzero(cold_observed)),
+            "cold_observed_area_m2": float(np.count_nonzero(cold_observed) * cell_area_m2),
+            "final_cell_count": int(np.count_nonzero(final_mask)),
+            "final_area_m2": float(np.count_nonzero(final_mask) * cell_area_m2),
+            "max_cold_count": int(np.max(cold_count)) if cold_count.size else 0,
+            "mean_support_fraction_observed": (
+                float(np.nanmean(fraction[observed])) if np.any(observed) else None
+            ),
+            "max_support_fraction": (
+                float(np.nanmax(fraction)) if np.any(np.isfinite(fraction)) else None
+            ),
+        }
+
+    return summary
+
+
+# -------------------------
+# BIAS FIELD YAW HELPERS 
 # -------------------------
 
 
@@ -1264,7 +1710,7 @@ def choose_bias_for_frame(tiff_path, bias_bundle):
     return bias_bundle["global"]["smooth"], "global"
 
 
-def process_one(tiff_path: str, report, bias_state=None, bias_field=None, bias_field_name=None, save_outputs=True):
+def process_one(tiff_path: str, report, bias_state=None, bias_field=None, bias_field_name=None, mask_agg=None, save_outputs=True):
     frame_id = find_frame_id(tiff_path)
     base = os.path.basename(tiff_path)
 
@@ -1518,9 +1964,14 @@ def process_one(tiff_path: str, report, bias_state=None, bias_field=None, bias_f
     diff_c = None
     contour_min_delta_c = None
     contour_levels_c = None
+    s2_coverage_mask = None
+    cumulative_cold_masks = {}
 
     if baseline_c is not None:
         diff_c = analysis_temp_c - baseline_c
+
+        if BUILD_CUMULATIVE_COLD_MASKS:
+            s2_coverage_mask, cumulative_cold_masks = build_cumulative_cold_masks(diff_c, S2)
 
         s2_valid = S2 & np.isfinite(diff_c)
         s2_diff = diff_c[s2_valid]
@@ -1572,35 +2023,73 @@ def process_one(tiff_path: str, report, bias_state=None, bias_field=None, bias_f
             )
             plt.close()
 
+        if BUILD_AGGREGATE_MASK_LAYERS and mask_agg is not None:
+            add_masks_to_aggregator(
+                mask_agg,
+                tiff_path,
+                s2_coverage_mask,
+                cumulative_cold_masks
+            )
+
+    cold_mask_pixel_counts = {}
+    if baseline_c is not None and BUILD_CUMULATIVE_COLD_MASKS:
+        for delta_c, mask in cumulative_cold_masks.items():
+            cold_mask_pixel_counts[threshold_label(delta_c)] = int(np.count_nonzero(mask))
+
     details = dict(hist_metrics)
     details.update({
-        "s_frac": float(s_frac),
-        "s2_frac": float(s2_frac),
-        "s2_over_s": float(ratio),
-        "baseline_percentile": int(BASELINE_PERCENTILE),
-        "baseline_c": None if baseline_c is None else float(baseline_c),
+        # texture / histogram thresholding
         "tex_win": int(TEX_WIN),
         "hist_smooth_k": int(HIST_SMOOTH_K),
         "angle_deg": float(ANGLE_DEG),
         "angle_run": int(ANGLE_RUN),
+
+        # S / S2 mask construction
+        "s_frac": float(s_frac),
+        "s2_frac": float(s2_frac),
+        "s2_over_s": float(ratio),
         "s2_mode": str(S2_MODE),
         "dilate_pixels": int(DILATE_PIXELS),
         "connectivity_8": bool(CONNECTIVITY_8),
-        "bias_min_count": int(BIAS_MIN_COUNT),
-        "bias_smooth_sigma": float(BIAS_SMOOTH_SIGMA),
-        "contour_step_c": float(CONTOUR_STEP_C),
-        "contour_min_delta_c": None if contour_min_delta_c is None else float(contour_min_delta_c),
-        "contour_levels_c": contour_levels_c,
+
+        # yaw peak grouping for directional bias
+        "yaw_hist_bin_deg": int(YAW_HIST_BIN_DEG),
+        "yaw_hist_smooth_sigma_bins": float(YAW_HIST_SMOOTH_SIGMA_BINS),
+        "yaw_peak_min_distance_deg": float(YAW_PEAK_MIN_DISTANCE_DEG),
+        "yaw_peak_support_window_deg": float(YAW_PEAK_SUPPORT_WINDOW_DEG),
+        "yaw_peak_min_raw_count": int(YAW_PEAK_MIN_RAW_COUNT),
+        "yaw_peak_degrees": [float(p) for p in YAW_PEAK_DEGREES],
+
+        # bias correction
         "bias_correction_applied": bool(bias_correction_applied),
         "use_directional_bias": bool(USE_DIRECTIONAL_BIAS),
         "bias_field_name": str(bias_field_name),
         "bias_direction": None if bias_direction is None else str(bias_direction),
         "bias_yaw_deg": None if bias_yaw_deg is None else float(bias_yaw_deg),
-        "yaw_hist_bin_deg": int(YAW_HIST_BIN_DEG),
-        "yaw_hist_smooth_sigma_bins": float(YAW_HIST_SMOOTH_SIGMA_BINS),
-        "yaw_peak_min_distance_deg": float(YAW_PEAK_MIN_DISTANCE_DEG),
-        "yaw_peak_min_raw_count": int(YAW_PEAK_MIN_RAW_COUNT),
-        "yaw_peak_degrees": [float(p) for p in YAW_PEAK_DEGREES],
+        "bias_min_count": int(BIAS_MIN_COUNT),
+        "bias_smooth_sigma": float(BIAS_SMOOTH_SIGMA),
+
+        # baseline
+        "baseline_percentile": int(BASELINE_PERCENTILE),
+        "baseline_c": None if baseline_c is None else float(baseline_c),
+
+        # visual contour output
+        "contour_step_c": float(CONTOUR_STEP_C),
+        "contour_min_delta_c": None if contour_min_delta_c is None else float(contour_min_delta_c),
+        "contour_levels_c": contour_levels_c,
+
+        # cumulative cold masks for later aggregation
+        "build_cumulative_cold_masks": bool(BUILD_CUMULATIVE_COLD_MASKS),
+        "cold_mask_min_delta_c": float(COLD_MASK_MIN_DELTA_C),
+        "cold_mask_max_delta_c": float(COLD_MASK_MAX_DELTA_C),
+        "cold_mask_thresholds_c": [float(x) for x in cold_threshold_values()],
+        "cold_mask_pixel_counts": cold_mask_pixel_counts,
+
+        # aggregate mask layers
+        "build_aggregate_mask_layers": bool(BUILD_AGGREGATE_MASK_LAYERS),
+        "agg_grid_res_m": float(AGG_GRID_RES_M),
+        "min_support_fraction": float(MIN_SUPPORT_FRACTION),
+        "min_s2_support_count": int(MIN_S2_SUPPORT_COUNT),
     })
 
     if baseline_c is not None:
@@ -1643,6 +2132,26 @@ def main(flight_root: str):
         print(" ", os.path.basename(p))
     print("")
 
+    print("Saving total flight footprint...")
+    save_total_flight_footprint_geojson(
+        tiffs,
+        os.path.join(LAYER_DIR, "flight_footprint.geojson")
+    )
+
+    mask_agg = None
+    if BUILD_AGGREGATE_MASK_LAYERS:
+        print("Initializing aggregate mask grid...")
+        mask_agg = init_mask_aggregator(tiffs)
+
+        if mask_agg is None:
+            print("  WARNING: aggregate mask grid could not be initialized.")
+        else:
+            grid = mask_agg["grid"]
+            print(
+                f"  aggregate grid: {grid['width']} x {grid['height']} "
+                f"cells at {grid['res_m']} m"
+            )
+
     print(f"Building bias field from all {len(tiffs)} frame(s)...")
     bias_report = _new_report()
     bias_state = None
@@ -1681,8 +2190,31 @@ def main(flight_root: str):
             bias_state=None,
             bias_field=frame_bias,
             bias_field_name=frame_bias_name,
+            mask_agg=mask_agg,
             save_outputs=True,
         )
+
+    if mask_agg is not None:
+        print("Saving aggregate raster layers...")
+        save_aggregate_rasters(mask_agg)
+
+    if mask_agg is not None:
+        report["mask_aggregation"] = {
+            "num_frames_added": int(mask_agg["num_frames_added"]),
+            "num_frames_skipped": int(mask_agg["num_frames_skipped"]),
+            "grid": {
+                "width": int(mask_agg["grid"]["width"]),
+                "height": int(mask_agg["grid"]["height"]),
+                "res_m": float(mask_agg["grid"]["res_m"]),
+                "crs": str(mask_agg["grid"]["crs"]),
+                "min_x": float(mask_agg["grid"]["min_x"]),
+                "max_y": float(mask_agg["grid"]["max_y"]),
+            },
+            "thresholds_c": [float(x) for x in cold_threshold_values()],
+            "min_support_fraction": float(MIN_SUPPORT_FRACTION),
+            "min_s2_support_count": int(MIN_S2_SUPPORT_COUNT),
+        }
+        report["aggregate_threshold_summary"] = summarize_aggregate_masks(mask_agg)
 
     write_report(report, OUTPUT_ROOT)
     write_text_report(report, OUTPUT_ROOT)
