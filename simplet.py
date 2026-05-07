@@ -45,6 +45,7 @@ THERMAL_HFOV_DEG = 33.0
 THERMAL_VFOV_DEG = 26.0
 THERMAL_WIDTH_PX = 640
 THERMAL_HEIGHT_PX = 512
+HIGH_ALTITUDE_WARNING_M = 450.0
 
 BURST_SIZE = 1000
 NUM_BURSTS = 1
@@ -869,6 +870,37 @@ def _utm_crs(lon: float, lat: float) -> CRS:
 
 def altitude_for_georef_m(meta: FrameMeta) -> float:
     return float(meta.alt_msl_m) if meta.alt_msl_m is not None else float(meta.alt_agl_m)
+
+
+def warn_high_altitudes(tiffs):
+    high = []
+
+    for p in tiffs:
+        meta = read_frame_meta_from_tiff(p)
+        if meta is None:
+            continue
+
+        alt_m = altitude_for_georef_m(meta)
+
+        if alt_m > HIGH_ALTITUDE_WARNING_M:
+            high.append((os.path.basename(p), float(alt_m)))
+
+    if not high:
+        return
+
+    max_alt = max(a for _, a in high)
+
+    print(
+        f"WARNING: {len(high)} frame(s) have ASL/MSL altitude above "
+        f"{HIGH_ALTITUDE_WARNING_M:.0f} m. Max altitude = {max_alt:.1f} m. "
+        f"High altitude increases GSD; consider increasing AGG_GRID_RES_M."
+    )
+
+    for base, alt_m in high[:10]:
+        print(f"  {base}: alt_used_m={alt_m:.1f}")
+
+    if len(high) > 10:
+        print(f"  ... {len(high) - 10} more")
 
 
 def footprint_dims_m_from_meta(meta: FrameMeta):
@@ -2329,7 +2361,6 @@ def main(flight_root: str):
 
     selected = pick_bursts(tiffs, BURST_SIZE, NUM_BURSTS)
 
-
     global YAW_PEAK_DEGREES
 
     all_yaws = collect_yaws_from_tiffs(tiffs)
@@ -2342,6 +2373,8 @@ def main(flight_root: str):
     for p in selected:
         print(" ", os.path.basename(p))
     print("")
+
+    warn_high_altitudes(tiffs)
 
     print("Saving total flight footprint...")
     save_total_flight_footprint_geojson(
