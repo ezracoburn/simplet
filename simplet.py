@@ -21,7 +21,7 @@ from collections import Counter
 import json
 from datetime import datetime
 
-OUTPUT_ROOT = "/Users/ezracoburn/Documents/Simple/output/5-7/East of Vaihu"
+OUTPUT_ROOT = "/Users/ezracoburn/Documents/Simple/output/5-8/East of Vaihu"
 
 BYFRAME_DIR = os.path.join(OUTPUT_ROOT, "byframe")
 PASSES_DIR = os.path.join(BYFRAME_DIR, "passes")
@@ -45,7 +45,11 @@ THERMAL_HFOV_DEG = 33.0
 THERMAL_VFOV_DEG = 26.0
 THERMAL_WIDTH_PX = 640
 THERMAL_HEIGHT_PX = 512
-HIGH_ALTITUDE_WARNING_M = 450.0
+HIGH_ALTITUDE_WARNING_M = 450.0     # appears because max GSD may be greater than AGG_GRID_RES_M = 0.5
+
+# "jpg" uses matching JPG GPS position.
+# "tiff" uses TIFF GPS position but keeps JPG yaw/altitude.
+GEOREF_POSITION_SOURCE = "jpg"      # "jpg" | "tiff"
 
 BURST_SIZE = 1000
 NUM_BURSTS = 1
@@ -54,34 +58,37 @@ NUM_BURSTS = 1
 NUM_IMAGES = BURST_SIZE * NUM_BURSTS
 
 # bias field constants
-APPLY_BIAS_CORRECTION = True
-BIAS_MIN_COUNT = 10
-BIAS_SMOOTH_SIGMA = 30
-USE_DIRECTIONAL_BIAS = True
+APPLY_BIAS_CORRECTION = True         
+BIAS_MIN_COUNT = 10                 # frames where pixel is in s2
+BIAS_SMOOTH_SIGMA = 30              # smoothing of actual bias field
+USE_DIRECTIONAL_BIAS = True         # True if you notice bias depends on yaw
 
+# yaw histogram for directional bias field creation
 YAW_HIST_BIN_DEG = 5
 YAW_HIST_SMOOTH_SIGMA_BINS = 1
-YAW_PEAK_MIN_DISTANCE_DEG = 35
+YAW_PEAK_MIN_DISTANCE_DEG = 35      # how much you want to divide the compass
 YAW_PEAK_SUPPORT_WINDOW_DEG = 15
-YAW_PEAK_MIN_RAW_COUNT = 25  # should be > bias_min_count, so all peaks can build a bias field
+YAW_PEAK_MIN_RAW_COUNT = 25         # should be > bias_min_count, so all peaks can build a bias field
 
 # mask building constants
-MIN_SMOOTH_FRAC = 0.10
-S2_OVER_S_MIN = 0.8
+MIN_SMOOTH_FRAC = 0.10              # minimum s2 fraction
+S2_OVER_S_MIN = 0.8                 # cuts frames where s2 is much smaller than s (jeopardizes s2 validity)
 BASELINE_PERCENTILE = 90
-BASELINE_BAND_DELTA_C = 0.1
-CONTOUR_STEP_C = 0.25
+BASELINE_BAND_DELTA_C = 0.1         # thickness of baseline band
+CONTOUR_STEP_C = 0.25               # visual contour step size
 
 # cumulative cold-mask aggregation constants
 BUILD_CUMULATIVE_COLD_MASKS = True
-COLD_MASK_MIN_DELTA_C = 0.25
-COLD_MASK_MAX_DELTA_C = 1.0
+COLD_MASK_MIN_DELTA_C = 0.20        # actual cold mask step size
+COLD_MASK_MAX_DELTA_C = 1.0         # max step (includes all delta c > this number)
 
 # aggregation constants
 BUILD_AGGREGATE_MASK_LAYERS = True
-AGG_GRID_RES_M = 0.5                    # should be > max GSD (~0.3 m for our flights)
-MIN_SUPPORT_FRACTION = 0.25
-MIN_S2_SUPPORT_COUNT = 2
+AGG_GRID_RES_M = 0.5                # should be > max GSD (~0.4 m for our flights)
+
+MIN_SUPPORT_FRACTION = 0.25         # mimimum fraction of frames that have this pixel that counted it as below the cold threshold
+MIN_COLD_SUPPORT_COUNT = 2          # minimum number of times this pixel was counted as below cold threshold
+MIN_S2_SUPPORT_COUNT = 2            # minimum number of times a pixel in s2 was counted
 
 # polygon output constants
 BUILD_AGGREGATE_POLYGONS = True
@@ -121,6 +128,8 @@ VERBOSE_FRAME_LOGS = False
 SPINNER_CHARS = ["|", "/", "-", "\\"]
 SAVE_CUT_DEBUG = True
 CUT_DEBUG_DPI = 120
+SAVE_DEBUG_PROJECTED_S2 = True
+DEBUG_PROJECTED_S2_FRAME_IDS = {"0005", "0014", "0123", "0135", "0431", "0442", "0453"}
 SAVE_DIST_HEATMAP = False
 DIST_HEATMAP_CLIP = 30   # clip distances for visualization (pixels)
                          #CANNOT SET TO 0 (runtime)
@@ -814,6 +823,25 @@ def _dms_to_deg(dms, ref) -> float:
     return val
 
 
+def read_lat_lon_from_exif_file(path: str):
+    try:
+        with open(path, "rb") as f:
+            tags = exifread.process_file(f, details=False)
+    except Exception:
+        return None
+
+    if "GPS GPSLatitude" not in tags or "GPS GPSLongitude" not in tags:
+        return None
+
+    try:
+        lat = _dms_to_deg(tags["GPS GPSLatitude"], tags["GPS GPSLatitudeRef"])
+        lon = _dms_to_deg(tags["GPS GPSLongitude"], tags["GPS GPSLongitudeRef"])
+    except Exception:
+        return None
+
+    return float(lat), float(lon)
+
+
 _XMP_BLOCK_RE = re.compile(rb"<x:xmpmeta.*?</x:xmpmeta>", re.DOTALL)
 _FLOAT_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
@@ -878,9 +906,25 @@ def read_frame_meta_from_tiff(tiff_path: str):
         return None
 
     try:
-        return read_frame_meta_from_jpg(jpg_path)
+        meta = read_frame_meta_from_jpg(jpg_path)
     except Exception:
         return None
+
+    if GEOREF_POSITION_SOURCE == "tiff":
+        tiff_lat_lon = read_lat_lon_from_exif_file(tiff_path)
+
+        if tiff_lat_lon is not None:
+            lat, lon = tiff_lat_lon
+
+            return FrameMeta(
+                lat=float(lat),
+                lon=float(lon),
+                yaw_deg=float(meta.yaw_deg),
+                alt_agl_m=float(meta.alt_agl_m),
+                alt_msl_m=None if meta.alt_msl_m is None else float(meta.alt_msl_m),
+            )
+
+    return meta
 
 
 def _utm_crs(lon: float, lat: float) -> CRS:
@@ -935,6 +979,84 @@ def footprint_dims_m_from_meta(meta: FrameMeta):
     return float(ground_w_m), float(ground_h_m), float(alt_m)
 
 
+def get_position_comparison_for_tiff(tiff_path: str):
+    jpg_path = find_matching_jpg(tiff_path)
+    if jpg_path is None:
+        return {
+            "available": False,
+            "reason": "no_matching_jpg",
+        }
+
+    jpg_lat_lon = read_lat_lon_from_exif_file(jpg_path)
+    tiff_lat_lon = read_lat_lon_from_exif_file(tiff_path)
+
+    if jpg_lat_lon is None or tiff_lat_lon is None:
+        return {
+            "available": False,
+            "reason": "missing_gps_in_jpg_or_tiff",
+        }
+
+    jpg_lat, jpg_lon = jpg_lat_lon
+    tiff_lat, tiff_lon = tiff_lat_lon
+
+    utm = _utm_crs(jpg_lon, jpg_lat)
+    to_utm = Transformer.from_crs("EPSG:4326", utm, always_xy=True)
+
+    jpg_x, jpg_y = to_utm.transform(jpg_lon, jpg_lat)
+    tiff_x, tiff_y = to_utm.transform(tiff_lon, tiff_lat)
+
+    dx_m = float(tiff_x - jpg_x)
+    dy_m = float(tiff_y - jpg_y)
+
+    return {
+        "available": True,
+        "jpg_lat": float(jpg_lat),
+        "jpg_lon": float(jpg_lon),
+        "tiff_lat": float(tiff_lat),
+        "tiff_lon": float(tiff_lon),
+        "tiff_minus_jpg_east_m": dx_m,
+        "tiff_minus_jpg_north_m": dy_m,
+        "tiff_minus_jpg_distance_m": float(math.sqrt(dx_m * dx_m + dy_m * dy_m)),
+    }
+
+
+def get_georef_details_for_tiff(tiff_path: str):
+    meta = read_frame_meta_from_tiff(tiff_path)
+
+    if meta is None:
+        return {
+            "available": False,
+            "position_source": str(GEOREF_POSITION_SOURCE),
+            "position_comparison": get_position_comparison_for_tiff(tiff_path),
+        }
+
+    ground_w_m, ground_h_m, alt_used_m = footprint_dims_m_from_meta(meta)
+
+    return {
+        "available": True,
+        "position_source": str(GEOREF_POSITION_SOURCE),
+        "lat": float(meta.lat),
+        "lon": float(meta.lon),
+        "yaw_deg": float(meta.yaw_deg),
+        "alt_agl_m": float(meta.alt_agl_m),
+        "alt_msl_m": None if meta.alt_msl_m is None else float(meta.alt_msl_m),
+        "alt_used_m": float(alt_used_m),
+        "altitude_mode": "MSL_ASL_if_available_else_AGL",
+        "thermal_hfov_deg": float(THERMAL_HFOV_DEG),
+        "thermal_vfov_deg": float(THERMAL_VFOV_DEG),
+        "thermal_width_px": int(THERMAL_WIDTH_PX),
+        "thermal_height_px": int(THERMAL_HEIGHT_PX),
+        "ground_w_m": float(ground_w_m),
+        "ground_h_m": float(ground_h_m),
+        "gsd_x_m": float(ground_w_m / THERMAL_WIDTH_PX),
+        "gsd_y_m": float(ground_h_m / THERMAL_HEIGHT_PX),
+        "position_comparison": get_position_comparison_for_tiff(tiff_path),
+    }
+
+
+
+
+
 def thermal_pixel_to_lonlat(
     x_px: float,
     y_px: float,
@@ -949,7 +1071,7 @@ def thermal_pixel_to_lonlat(
     cy = (THERMAL_HEIGHT_PX - 1) / 2
 
     dx_m = (x_px - cx) * mx
-    dy_m = (y_px - cy) * my
+    dy_m = -(y_px - cy) * my
 
     yaw = math.radians(meta.yaw_deg)
 
@@ -1228,7 +1350,7 @@ def pixel_centers_to_agg_indices(tiff_path: str, mask_shape, agg):
     col_grid, row_grid = np.meshgrid(cols, rows)
 
     dx_m = (col_grid - cx) * mx
-    dy_m = (row_grid - cy) * my
+    dy_m = -(row_grid - cy) * my
 
     yaw = math.radians(meta.yaw_deg)
 
@@ -1324,6 +1446,40 @@ def write_geotiff(path, array, grid, dtype=None, nodata=None):
         dst.write(arr, 1)
 
 
+def save_debug_projected_s2(mask_agg, tiff_path, s2_coverage_mask):
+    if mask_agg is None or s2_coverage_mask is None:
+        return
+
+    agg_rows, agg_cols, in_bounds = pixel_centers_to_agg_indices(
+        tiff_path,
+        s2_coverage_mask.shape,
+        mask_agg
+    )
+
+    if agg_rows is None:
+        return
+
+    grid = mask_agg["grid"]
+    width = grid["width"]
+
+    debug = np.zeros((grid["height"], grid["width"]), dtype=np.uint8)
+
+    valid = s2_coverage_mask & in_bounds
+    if np.any(valid):
+        linear = agg_rows[valid] * width + agg_cols[valid]
+        unique = np.unique(linear)
+        debug.ravel()[unique] = 1
+
+    frame_id = find_frame_id(tiff_path) or "unknown"
+    write_geotiff(
+        os.path.join(RASTER_LAYER_DIR, f"debug_s2_projected_IRX_{frame_id}.tif"),
+        debug,
+        grid,
+        dtype=np.uint8,
+        nodata=0
+    )
+
+
 def save_aggregate_rasters(mask_agg):
     if mask_agg is None:
         return
@@ -1381,6 +1537,7 @@ def save_aggregate_rasters(mask_agg):
 
         final_mask = (
             valid_s2
+            & (cold_count >= MIN_COLD_SUPPORT_COUNT)
             & np.isfinite(fraction)
             & (fraction >= MIN_SUPPORT_FRACTION)
         )
@@ -1411,6 +1568,7 @@ def summarize_aggregate_masks(mask_agg):
         "observed_area_m2": float(np.count_nonzero(observed) * cell_area_m2),
         "valid_s2_cell_count": int(np.count_nonzero(valid_s2)),
         "valid_s2_area_m2": float(np.count_nonzero(valid_s2) * cell_area_m2),
+        "min_cold_support_count": int(MIN_COLD_SUPPORT_COUNT),
         "max_s2_count": int(np.max(s2_count)) if s2_count.size else 0,
         "thresholds": {},
     }
@@ -1424,6 +1582,7 @@ def summarize_aggregate_masks(mask_agg):
 
         final_mask = (
             valid_s2
+            & (cold_count >= MIN_COLD_SUPPORT_COUNT)
             & np.isfinite(fraction)
             & (fraction >= MIN_SUPPORT_FRACTION)
         )
@@ -1571,6 +1730,7 @@ def save_aggregate_polygons(mask_agg):
 
         final_mask = (
             valid_s2
+            & (cold_count >= MIN_COLD_SUPPORT_COUNT)
             & np.isfinite(fraction)
             & (fraction >= MIN_SUPPORT_FRACTION)
         )
@@ -1594,6 +1754,7 @@ def save_aggregate_polygons(mask_agg):
                 "delta_c": float(delta_c),
                 "min_support_fraction": float(MIN_SUPPORT_FRACTION),
                 "min_s2_support_count": int(MIN_S2_SUPPORT_COUNT),
+                "min_cold_support_count": int(MIN_COLD_SUPPORT_COUNT),
                 "region_count_before_union": int(region_count),
                 "area_m2": float(area_m2),
             }
@@ -1971,6 +2132,8 @@ def choose_bias_for_frame(tiff_path, bias_bundle):
 def process_one(tiff_path: str, report, bias_state=None, bias_field=None, bias_field_name=None, mask_agg=None, save_outputs=True):
     frame_id = find_frame_id(tiff_path)
     base = os.path.basename(tiff_path)
+    
+    georef_details = get_georef_details_for_tiff(tiff_path)
 
     with rasterio.open(tiff_path) as src:
         raw = src.read(1)
@@ -2291,6 +2454,9 @@ def process_one(tiff_path: str, report, bias_state=None, bias_field=None, bias_f
                 s2_coverage_mask,
                 cumulative_cold_masks
             )
+        
+            if SAVE_DEBUG_PROJECTED_S2 and frame_id in DEBUG_PROJECTED_S2_FRAME_IDS:
+                save_debug_projected_s2(mask_agg, tiff_path, s2_coverage_mask)
 
     cold_mask_pixel_counts = {}
     if baseline_c is not None and BUILD_CUMULATIVE_COLD_MASKS:
@@ -2299,6 +2465,7 @@ def process_one(tiff_path: str, report, bias_state=None, bias_field=None, bias_f
 
     details = dict(hist_metrics)
     details.update({
+        
         # texture / histogram thresholding
         "tex_win": int(TEX_WIN),
         "hist_smooth_k": int(HIST_SMOOTH_K),
@@ -2312,6 +2479,9 @@ def process_one(tiff_path: str, report, bias_state=None, bias_field=None, bias_f
         "s2_mode": str(S2_MODE),
         "dilate_pixels": int(DILATE_PIXELS),
         "connectivity_8": bool(CONNECTIVITY_8),
+
+        # georeferencing 
+        "georef": georef_details,
 
         # yaw peak grouping for directional bias
         "yaw_hist_bin_deg": int(YAW_HIST_BIN_DEG),
@@ -2492,6 +2662,7 @@ def main(flight_root: str):
             "thresholds_c": [float(x) for x in cold_threshold_values()],
             "min_support_fraction": float(MIN_SUPPORT_FRACTION),
             "min_s2_support_count": int(MIN_S2_SUPPORT_COUNT),
+            "min_cold_support_count": int(MIN_COLD_SUPPORT_COUNT),
         }
         
         report["aggregate_threshold_summary"] = summarize_aggregate_masks(mask_agg)
