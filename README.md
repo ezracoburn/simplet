@@ -140,7 +140,7 @@ The polygon GeoJSON files include an `area_m2` property computed in projected co
 |---|---|
 | `TEX_WIN` | Local standard deviation window size (pixels) |
 | `HIST_SMOOTH_K` | Kernel for main histogram smoothing; must be odd |
-| `PEAK_HEIGHT_K` | Kernel for lighter smoothing used in the raw peak-height QC metric; must be odd |
+| `PEAK_HEIGHT_K` | Kernel for lighter smoothing used in the rawer peak-height QC metric; must be odd |
 | `ANGLE_DEG` / `ANGLE_RUN` | Controls the angle-knee threshold detection sensitivity |
 | `S2_MODE` | `"largest"` keeps the biggest connected S component; `"edge"` keeps edge-touching components; `"within_x"` keeps pixels within `DILATE_PIXELS` of the largest component |
 | `CONNECTIVITY_8` | 8- vs 4-neighbor connected components |
@@ -157,7 +157,7 @@ Filters are toggled individually via the `FILTERS_ENABLED` dictionary. The thres
 | `PEAK_WIDTH_MAX` | Maximum peak FWHM width |
 | `PEAK_SHARPNESS_MIN` | Minimum peak sharpness |
 | `MIN_SMOOTH_FRAC` | Minimum fraction of the frame that must be S2 to compute a baseline |
-| `S2_OVER_S_MIN` | Minimum S2/S ratio; rejects frames where the smooth-ocean mask fragments excessively |
+| `S2_OVER_S_MIN` | Minimum S2/S ratio; rejects frames with low-texture land components (e.g., shaded land) |
 
 ### Baseline and cold masks
 | Constant | Description |
