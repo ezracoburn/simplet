@@ -2,8 +2,8 @@
 
 A processing pipeline for Autel 640T thermal drone imagery, designed to detect potential submarine groundwater discharge (SGD) signals in coastal ocean flights. The script processes a full flight directory, corrects within-frame thermal bias, identifies colder-than-baseline ocean regions, and aggregates those detections across frames into georeferenced raster and polygon outputs ready for area analysis in ArcGIS or QGIS.
 
+Disclaimer: Claude Sonnet 4.6 wrote this README. I have reviewed it for accuracy.
 
-Disclaimer: Claude wrote this README. I have checked it for accuracy.
 ---
 
 ## Quick Start
