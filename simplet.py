@@ -21,7 +21,7 @@ from collections import Counter
 import json
 from datetime import datetime
 
-OUTPUT_ROOT = "/Users/ezracoburn/Documents/Simple/output/5-8/East of Vaihu"
+OUTPUT_ROOT = "[YOUR OUTPUT ROOT HERE]"
 
 BYFRAME_DIR = os.path.join(OUTPUT_ROOT, "byframe")
 PASSES_DIR = os.path.join(BYFRAME_DIR, "passes")
@@ -61,7 +61,7 @@ NUM_IMAGES = BURST_SIZE * NUM_BURSTS
 APPLY_BIAS_CORRECTION = True         
 BIAS_MIN_COUNT = 10                 # frames where pixel is in s2
 BIAS_SMOOTH_SIGMA = 30              # smoothing of actual bias field
-USE_DIRECTIONAL_BIAS = True         # True if you notice bias depends on yaw
+USE_DIRECTIONAL_BIAS = True         # False if you notice bias does not depend on yaw
 
 # yaw histogram for directional bias field creation
 YAW_HIST_BIN_DEG = 5
@@ -74,21 +74,21 @@ YAW_PEAK_MIN_RAW_COUNT = 25         # should be > bias_min_count, so all peaks c
 MIN_SMOOTH_FRAC = 0.10              # minimum s2 fraction
 S2_OVER_S_MIN = 0.8                 # cuts frames where s2 is much smaller than s (jeopardizes s2 validity)
 BASELINE_PERCENTILE = 90
-BASELINE_BAND_DELTA_C = 0.1         # thickness of baseline band
+BASELINE_BAND_DELTA_C = 0.1         # thickness of baseline band for visualisaiton
 CONTOUR_STEP_C = 0.25               # visual contour step size
 
 # cumulative cold-mask aggregation constants
 BUILD_CUMULATIVE_COLD_MASKS = True
-COLD_MASK_MIN_DELTA_C = 0.20        # actual cold mask step size
-COLD_MASK_MAX_DELTA_C = 1.0         # max step (includes all delta c > this number)
+COLD_MASK_MIN_DELTA_C = 0.10        # actual cold mask *STEP SIZE* (poor name)
+COLD_MASK_MAX_DELTA_C = 0.6         # max step (includes all delta c > this number)
 
 # aggregation constants
 BUILD_AGGREGATE_MASK_LAYERS = True
 AGG_GRID_RES_M = 0.5                # should be > max GSD (~0.4 m for our flights)
 
-MIN_SUPPORT_FRACTION = 0.25         # mimimum fraction of frames that have this pixel that counted it as below the cold threshold
-MIN_COLD_SUPPORT_COUNT = 2          # minimum number of times this pixel was counted as below cold threshold
-MIN_S2_SUPPORT_COUNT = 2            # minimum number of times a pixel in s2 was counted
+MIN_SUPPORT_FRACTION = 0.5         # mimimum fraction of frames that have this pixel that counted it as below the cold threshold
+MIN_COLD_SUPPORT_COUNT = 3          # minimum number of times this pixel was counted as below cold threshold
+MIN_S2_SUPPORT_COUNT = 3            # minimum number of times a pixel in s2 was counted
 
 # polygon output constants
 BUILD_AGGREGATE_POLYGONS = True
@@ -128,11 +128,11 @@ VERBOSE_FRAME_LOGS = False
 SPINNER_CHARS = ["|", "/", "-", "\\"]
 SAVE_CUT_DEBUG = True
 CUT_DEBUG_DPI = 120
-SAVE_DEBUG_PROJECTED_S2 = True
-DEBUG_PROJECTED_S2_FRAME_IDS = {"0005", "0014", "0123", "0135", "0431", "0442", "0453"}
+SAVE_DEBUG_PROJECTED_S2 = False
+DEBUG_PROJECTED_S2_FRAME_IDS = {"1093", "1087", "1084", "0877", "0866", "0846", "0840"}
 SAVE_DIST_HEATMAP = False
 DIST_HEATMAP_CLIP = 30   # clip distances for visualization (pixels)
-                         #CANNOT SET TO 0 (runtime)
+                         # CANNOT SET TO 0 (runtime)
 
 FILTERS_ENABLED = {
     "thr_max": True,
@@ -2684,5 +2684,5 @@ def main(flight_root: str):
 
 
 if __name__ == "__main__":
-    FLIGHT_ROOT = '/Volumes/EXTERNAL HD/July 2024/Autel-East of Vaihu'
+    FLIGHT_ROOT = '[YOUR FLIGHT DIRECTORY HERE]'
     main(FLIGHT_ROOT)
