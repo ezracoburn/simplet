@@ -2,7 +2,7 @@
 
 A processing pipeline for Autel 640T thermal drone imagery, designed to detect potential submarine groundwater discharge (SGD) signals in coastal ocean flights. The script processes a full flight directory, corrects within-frame thermal bias, identifies colder-than-baseline ocean regions, and aggregates those detections across frames into georeferenced raster and polygon outputs ready for area analysis in ArcGIS or QGIS.
 
-Disclaimer: Claude Sonnet 4.6 wrote this README. I have reviewed it for accuracy.
+Disclaimer: Claude Sonnet 4.6 assisted in writing this README. I have reviewed it for accuracy.
 
 ---
 
@@ -34,7 +34,7 @@ The pipeline runs in two passes over the flight imagery.
 
 **Pass 1 — Bias field construction (all frames, no output written)**
 
-For every frame in the flight that passes QC, the script computes a smooth-water ocean mask (S2) and accumulates a per-pixel running average of the frame's temperature deviation from its own S2 baseline. These deviations are averaged in image coordinates across all usable frames, filling sparse pixels with a local median, smoothing the result with a Gaussian filter, and anchoring it so the field is mean-zero. If `USE_DIRECTIONAL_BIAS` is enabled, this is done separately for each dominant yaw direction detected from the flight's yaw histogram, giving each heading its own bias field.
+For every frame in the flight, the script runs the full QC pipeline outlined in Pass 2 — texture computation, histogram thresholding, S/S2 mask construction, and all filters — silently, without writing any images or report entries. Frames that fail QC are skipped. For frames that pass, the script computes a smooth-water ocean mask (S2) and accumulates a per-pixel running average of the frame's temperature deviation from its own S2 baseline. These deviations are averaged in image coordinates across all usable frames, filling sparse pixels with a local median, smoothing the result with a Gaussian filter, and anchoring it so the field is mean-zero. If `USE_DIRECTIONAL_BIAS` is enabled, this is done separately for each dominant yaw direction detected from the flight's yaw histogram, giving each heading its own bias field.
 
 **Pass 2 — Frame processing and aggregation (selected frames)**
 
