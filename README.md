@@ -157,7 +157,7 @@ Filters are toggled individually via the `FILTERS_ENABLED` dictionary. The thres
 | `PEAK_WIDTH_MAX` | Maximum peak FWHM width |
 | `PEAK_SHARPNESS_MIN` | Minimum peak sharpness |
 | `MIN_SMOOTH_FRAC` | Minimum fraction of the frame that must be S2 to compute a baseline |
-| `S2_OVER_S_MIN` | Minimum S2/S ratio; rejects frames with low-texture land components (e.g., shaded land) |
+| `S2_OVER_S_MIN` | Minimum S2/S ratio; rejects frames with disconnected low-texture land components (e.g., shaded land) |
 
 ### Baseline and cold masks
 | Constant | Description |
@@ -187,7 +187,7 @@ Filters are toggled individually via the `FILTERS_ENABLED` dictionary. The thres
 |---|---|
 | `VERBOSE_FRAME_LOGS` | Print per-frame details to terminal; set `False` for a cleaner progress bar |
 | `SAVE_CUT_DEBUG` | Save debug images for QC-rejected frames |
-| `SAVE_DEBUG_PROJECTED_S2` | Save individual projected S2 GeoTIFFs for specific frames (slow) |
+| `SAVE_DEBUG_PROJECTED_S2` | Save individual projected S2 GeoTIFFs for specific frames for inspecting geospatial offset |
 | `DEBUG_PROJECTED_S2_FRAME_IDS` | Set of frame ID strings to save projected S2 debug rasters for |
 | `SAVE_DIST_HEATMAP` | Save distance-to-largest-component heatmaps (only meaningful when `S2_MODE = "within_x"`) |
 
