@@ -4,6 +4,8 @@ A processing pipeline for Autel 640T thermal drone imagery, designed to detect p
 
 Disclaimer: Claude Sonnet 4.6 assisted in writing this README. I have reviewed it for accuracy.
 
+<img width="3000" height="2100" alt="thermal script flowchart (1)" src="https://github.com/user-attachments/assets/fe2329e3-9fbb-4746-9724-ef3597a83a63" />
+
 ---
 
 ## Quick Start
