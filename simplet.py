@@ -21,7 +21,7 @@ from collections import Counter
 import json
 from datetime import datetime
 
-OUTPUT_ROOT = "[YOUR OUTPUT ROOT HERE]"
+OUTPUT_ROOT = '/Volumes/EXTERNAL HD/Simple/output/5-25/west of vaihu - no bias correction'
 
 BYFRAME_DIR = os.path.join(OUTPUT_ROOT, "byframe")
 PASSES_DIR = os.path.join(BYFRAME_DIR, "passes")
@@ -58,7 +58,7 @@ NUM_BURSTS = 1
 NUM_IMAGES = BURST_SIZE * NUM_BURSTS
 
 # bias field constants
-APPLY_BIAS_CORRECTION = True         
+APPLY_BIAS_CORRECTION = True        
 BIAS_MIN_COUNT = 10                 # frames where pixel is in s2
 BIAS_SMOOTH_SIGMA = 30              # smoothing of actual bias field
 USE_DIRECTIONAL_BIAS = True         # False if you notice bias does not depend on yaw
@@ -2684,5 +2684,5 @@ def main(flight_root: str):
 
 
 if __name__ == "__main__":
-    FLIGHT_ROOT = '[YOUR FLIGHT DIRECTORY HERE]'
+    FLIGHT_ROOT = '/Volumes/EXTERNAL HD/July 2024/Autel-West of Vaihu'
     main(FLIGHT_ROOT)
